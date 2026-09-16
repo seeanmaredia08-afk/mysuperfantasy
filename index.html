@@ -180,6 +180,47 @@
   .refresh-btn:disabled{opacity:0.5;cursor:default;}
   @keyframes ptsflash{0%{color:var(--live);transform:scale(1.06);}100%{color:inherit;transform:scale(1);}}
   .flash{animation:ptsflash 1.1s ease-out;}
+
+  /* win probability */
+  .winbar-wrap{padding:10px 18px 12px;border-top:1px solid var(--line);}
+  .winbar-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px;}
+  .winbar-pct{font-family:'Oswald';font-size:14px;font-weight:600;font-variant-numeric:tabular-nums;}
+  .winbar-label{font-family:'Oswald';font-size:9.5px;letter-spacing:0.14em;color:var(--text-faint);text-transform:uppercase;}
+  .winbar{height:6px;border-radius:3px;background:var(--div2-dim);overflow:hidden;}
+  .winbar-fill{height:100%;background:var(--div1);border-radius:3px 0 0 3px;transition:width .6s cubic-bezier(.4,0,.2,1);}
+  .winbar-wrap.settled .winbar-label{color:var(--text-faint);}
+  .winbar-wrap.settled .winbar-fill{background:var(--live);}
+  @media(prefers-reduced-motion:reduce){.winbar-fill{transition:none;}}
+
+  /* sport picker */
+  .sport-picker{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;}
+  .sport-opt{position:relative;display:flex;flex-direction:column;align-items:flex-start;gap:1px;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:11px 12px;color:var(--text-dim);text-align:left;}
+  .sport-opt:hover{border-color:var(--text-dim);color:var(--text);}
+  .sport-opt.active{border-color:var(--live);background:var(--panel-alt);color:var(--text);}
+  .sport-name{font-family:'Oswald';font-size:13.5px;letter-spacing:0.03em;text-transform:uppercase;font-weight:600;}
+  .sport-sub{font-size:10.5px;color:var(--text-faint);}
+  .sport-live{position:absolute;top:8px;right:9px;font-family:'Oswald';font-size:8px;letter-spacing:0.06em;text-transform:uppercase;color:var(--live);}
+
+  /* injury report */
+  .inj-summary{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin-bottom:10px;}
+  .inj-chip{font-family:'Oswald';font-size:10px;letter-spacing:0.07em;text-transform:uppercase;color:var(--text-dim);background:var(--panel-alt);border:1px solid var(--line);border-radius:5px;padding:3px 8px;}
+  .inj-chip b{color:var(--text);}
+  .inj-total{font-size:11px;color:var(--text-faint);margin-left:auto;}
+  .inj-player{display:flex;align-items:center;gap:7px;}
+  .inj-name{font-weight:600;}
+  .inj-starter{font-family:'Oswald';font-size:8px;letter-spacing:0.06em;text-transform:uppercase;color:var(--div1);border:1px solid var(--div1-dim);border-radius:3px;padding:1px 4px;}
+  .inj-nfl{font-size:10.5px;color:var(--text-faint);margin-top:2px;padding-left:1px;}
+  .inj-detail,.inj-team{color:var(--text-dim);font-size:12.5px;}
+
+  /* free agents */
+  .fa-controls{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:10px;}
+  .fa-tab{font-family:'Oswald';font-size:11.5px;letter-spacing:0.05em;color:var(--text-faint);background:transparent;border:1px solid var(--line);border-radius:20px;padding:5px 12px;}
+  .fa-tab:hover{color:var(--text);border-color:var(--text-dim);}
+  .fa-tab.active{background:var(--text);color:var(--bg);border-color:var(--text);font-weight:600;}
+  .fa-note{font-size:11px;color:var(--text-faint);margin-left:auto;}
+  .fa-nfl{color:var(--text-faint);font-size:12px;}
+  .fa-proj{font-family:'Oswald';font-weight:600;}
+  .fa-healthy{color:var(--text-faint);}
   @media(prefers-reduced-motion:reduce){.flash{animation:none;}.live-pill.on .dot-live{animation:none;}}
 
   .week-tabs{display:flex;gap:6px;overflow-x:auto;padding:16px 0;margin-bottom:4px;border-bottom:1px solid var(--line);}
@@ -255,6 +296,21 @@ const SLEEPER = 'https://api.sleeper.app/v1';
 const SLEEPER_DATA = 'https://api.sleeper.com'; // projections + live game clocks
 const EMAIL_DOMAIN = '@commish.leagueroom.com';
 
+/* ============================ SPORTS ============================
+   Sleeper's live endpoints only cover NFL in full. Other sports can still be
+   chosen when creating a league — the pick is stored and shown — but those
+   divisions fall back to a clear "no live sync" notice rather than pretending
+   to have data. `live:true` means projections and game clocks are available. */
+const SPORTS = [
+  { id:'nfl',    label:'Football',   sub:'NFL',         live:true  },
+  { id:'nba',    label:'Basketball', sub:'NBA',         live:false },
+  { id:'mlb',    label:'Baseball',   sub:'MLB',         live:false },
+  { id:'nhl',    label:'Hockey',     sub:'NHL',         live:false },
+  { id:'soccer', label:'Soccer',     sub:'Association', live:false }
+];
+function sportById(id){ return SPORTS.find(s=>s.id===id) || SPORTS[0]; }
+function leagueSport(league){ return sportById((league && league.sport) || 'nfl'); }
+
 /* ============================ BUILT-IN LEAGUES ============================
    Leagues defined here instead of in the database. They need no commissioner
    account and no Supabase rows, so they always resolve — handy as a permanent
@@ -327,11 +383,19 @@ async function sleeperApi(path){
   if(!res.ok) throw new Error('Sleeper error ' + res.status);
   return res.json();
 }
-function ensurePlayers(){
-  if(sleeperCache.players) return Promise.resolve(sleeperCache.players);
-  if(sleeperCache.playersPromise) return sleeperCache.playersPromise;
-  sleeperCache.playersPromise = sleeperApi('/players/nfl').then(d=>{ sleeperCache.players=d; return d; });
-  return sleeperCache.playersPromise;
+/* `sleeperCache.players` always holds the map for the sport last loaded; every
+   consumer works on one sport at a time, so a single active map is enough. */
+function ensurePlayers(sport){
+  sport = sport || 'nfl';
+  sleeperCache.playersBySport = sleeperCache.playersBySport || {};
+  const cached = sleeperCache.playersBySport[sport];
+  if(cached){ sleeperCache.players = cached; return Promise.resolve(cached); }
+  sleeperCache.playersPromises = sleeperCache.playersPromises || {};
+  if(sleeperCache.playersPromises[sport]) return sleeperCache.playersPromises[sport];
+  sleeperCache.playersPromises[sport] = sleeperApi(`/players/${sport}`)
+    .then(d=>{ sleeperCache.playersBySport[sport]=d; sleeperCache.players=d; return d; })
+    .catch(e=>{ delete sleeperCache.playersPromises[sport]; throw e; });
+  return sleeperCache.playersPromises[sport];
 }
 async function ensureNflState(){
   if(sleeperCache.nflState) return sleeperCache.nflState;
@@ -617,6 +681,57 @@ document.addEventListener('visibilitychange', ()=>{
   else updateLiveStatus();
 });
 
+/* ============================ WIN PROBABILITY ============================
+   Each team's final score is treated as a normal distribution centred on its
+   live projection. The spread comes only from points still to be scored: a
+   starter whose game is over contributes no uncertainty, one who hasn't kicked
+   off contributes a lot. Win probability is then P(A - B > 0).
+
+   SCORE_VOLATILITY is the assumed standard deviation of a player's remaining
+   points as a fraction of those points. 0.6 is an approximation — weekly
+   fantasy scoring is genuinely noisy — so this is a useful signal, not a
+   precise forecast, and the UI says as much.                                */
+const SCORE_VOLATILITY = 0.6;
+
+/* Abramowitz & Stegun 7.1.26 — plenty accurate for a displayed percentage. */
+function normalCdf(z){
+  const sign = z < 0 ? -1 : 1;
+  const x = Math.abs(z) / Math.SQRT2;
+  const t = 1 / (1 + 0.3275911 * x);
+  const y = 1 - ((((1.061405429*t - 1.453152027)*t + 1.421413741)*t - 0.284496736)*t + 0.254829592) * t * Math.exp(-x*x);
+  return 0.5 * (1 + sign * y);
+}
+
+function teamSigma(le){
+  // Independent contributions, so variances add.
+  const variance = le.rows.reduce((sum,r)=>{
+    const remaining = r.full * r.frac;
+    return sum + Math.pow(SCORE_VOLATILITY * remaining, 2);
+  }, 0);
+  return Math.sqrt(variance);
+}
+
+/* Returns team A's chance of winning, 0-1. */
+function winProbability(l1, l2){
+  if(!l1 || !l2) return null;
+  const margin = l1.projected - l2.projected;
+  const sigma = Math.sqrt(Math.pow(teamSigma(l1),2) + Math.pow(teamSigma(l2),2));
+  if(sigma < 0.5){
+    // Nothing meaningful left to play — the current margin decides it.
+    if(Math.abs(margin) < 0.05) return 0.5;
+    return margin > 0 ? 1 : 0;
+  }
+  return normalCdf(margin / sigma);
+}
+
+function formatWinPct(p){
+  if(p == null) return '';
+  if(p >= 0.9995) return '>99.9%';
+  if(p <= 0.0005) return '<0.1%';
+  if(p >= 0.995 || p <= 0.005) return (p*100).toFixed(1) + '%';
+  return Math.round(p*100) + '%';
+}
+
 function entryLive(entry, scoring, season, week){
   const starters = entry.starters || [];
   const pts = entry.starters_points || [];
@@ -787,6 +902,17 @@ async function renderCreate(app){
         <label class="form-label">League Name</label>
         <input class="form-input" id="f_name" placeholder="e.g. The Maredia Super League" required>
       </div>
+      <div class="form-group">
+        <label class="form-label">Sport</label>
+        <div class="sport-picker" id="sportPicker">
+          ${SPORTS.map((s,i)=>`<button type="button" class="sport-opt ${i===0?'active':''}" data-sport="${s.id}">
+            <span class="sport-name">${escapeHtml(s.label)}</span>
+            <span class="sport-sub">${escapeHtml(s.sub)}</span>
+            ${s.live?'<span class="sport-live">Live sync</span>':''}
+          </button>`).join('')}
+        </div>
+        <div class="form-hint" id="sportHint"></div>
+      </div>
       <div class="form-row2">
         <div class="form-group">
           <label class="form-label">Your Email</label>
@@ -825,6 +951,25 @@ async function renderCreate(app){
       <button type="submit" class="primary-btn" id="submitBtn" style="margin-top:10px;">Create League</button>
     </form>
   `;
+
+  let chosenSport = 'nfl';
+  const sportPicker = document.getElementById('sportPicker');
+  const sportHint = document.getElementById('sportHint');
+  function paintSportHint(){
+    const s = sportById(chosenSport);
+    sportHint.textContent = s.live
+      ? 'Live scoring, projections and injury data sync automatically for this sport.'
+      : `${s.label} leagues are saved and organised here, but live sync isn't available for ${s.sub} yet — scores need to be entered manually.`;
+  }
+  sportPicker.querySelectorAll('.sport-opt').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      sportPicker.querySelectorAll('.sport-opt').forEach(b=>b.classList.remove('active'));
+      btn.classList.add('active');
+      chosenSport = btn.dataset.sport;
+      paintSportHint();
+    });
+  });
+  paintSportHint();
 
   const numDivInput = document.getElementById('f_numdiv');
   const fieldsEl = document.getElementById('divisionFields');
@@ -922,11 +1067,28 @@ async function renderCreate(app){
 
       const inviteCode = String(Math.floor(100000 + Math.random()*900000));
 
-      const leagueRows = await sbFetch('/rest/v1/leagues', {
-        method:'POST',
-        headers:{ Authorization:'Bearer '+token, Prefer:'return=representation' },
-        body: JSON.stringify({ name, slug, email, commissioner_id: uid, num_divisions:numDiv, playoff_length_weeks:playoffWeeks, playoff_advance_count:advance, invite_code: inviteCode, is_public: isPublic })
-      });
+      const baseRow = { name, slug, email, commissioner_id: uid, num_divisions:numDiv,
+        playoff_length_weeks:playoffWeeks, playoff_advance_count:advance,
+        invite_code: inviteCode, is_public: isPublic };
+
+      // `sport` is a newer column. If the database doesn't have it yet, retry
+      // without it rather than failing the whole league creation.
+      let leagueRows;
+      try{
+        leagueRows = await sbFetch('/rest/v1/leagues', {
+          method:'POST',
+          headers:{ Authorization:'Bearer '+token, Prefer:'return=representation' },
+          body: JSON.stringify({ ...baseRow, sport: chosenSport })
+        });
+      }catch(err){
+        if(!/sport/i.test(err.message||'')) throw err;
+        console.warn('leagues.sport column missing — saving without it.', err.message);
+        leagueRows = await sbFetch('/rest/v1/leagues', {
+          method:'POST',
+          headers:{ Authorization:'Bearer '+token, Prefer:'return=representation' },
+          body: JSON.stringify(baseRow)
+        });
+      }
       const league = leagueRows[0];
 
       const divRows = await sbFetch('/rest/v1/divisions', {
@@ -1174,7 +1336,7 @@ async function renderLeagueHome(app, league, divisions){
     + leagueNavHtml(league, divisions, 'overview') + `
     <div class="hero" style="margin:10px 0 8px;">
       <h1 style="font-size:clamp(26px,5vw,38px);">${escapeHtml(league.name)}</h1>
-      <p>${divisions.length} divisions &middot; Top ${league.playoff_advance_count} make the playoffs &middot; ${league.playoff_length_weeks}-week playoff bracket</p>
+      <p>${escapeHtml(leagueSport(league).label)} &middot; ${divisions.length} divisions &middot; Top ${league.playoff_advance_count} make the playoffs &middot; ${league.playoff_length_weeks}-week playoff bracket</p>
     </div>
     <div class="tiles-grid" id="divTiles">
       ${divisions.map(d=>`<a class="tile" href="#/league/${league.slug}/division/${d.id}">
@@ -1264,13 +1426,20 @@ async function renderDivisionPage(app, league, divisions, divId){
   const division = divisions.find(d=>d.id===divId);
   if(!division){ app.innerHTML = topbarHtml(`#/league/${league.slug}`) + `<div class="state-msg error">Division not found.</div>`; return; }
 
-  if(division.platform !== 'sleeper' || !division.external_league_id){
+  const sport = leagueSport(league);
+  if(division.platform !== 'sleeper' || !division.external_league_id || !sport.live){
+    let msg;
+    if(!sport.live){
+      msg = `This is a ${sport.label.toLowerCase()} league. Live scoring, projections and injury data are only available for football (NFL) right now, so this division needs scores entered manually.`;
+    } else if(division.platform==='espn'){
+      msg = "ESPN live sync for this division is being finalized — public leagues will pull automatically once enabled; private leagues use the cookies your commissioner provided.";
+    } else {
+      msg = `${platformLabel[division.platform]} doesn't support automatic live sync yet. Ask your commissioner to enter scores manually, or switch this division to Sleeper for full live stats.`;
+    }
     app.innerHTML = topbarHtml(`#/league/${league.slug}`)
       + leagueNavHtml(league, divisions, 'div:'+division.id) + `
       <div class="hero" style="margin:10px 0;"><h1 style="font-size:26px;">${escapeHtml(division.name)}</h1></div>
-      <div class="alert info">
-        ${division.platform==='espn' ? "ESPN live sync for this division is being finalized — public leagues will pull automatically once enabled; private leagues use the cookies your commissioner provided." : `${platformLabel[division.platform]} doesn't support automatic live sync yet. Ask your commissioner to enter scores manually, or switch this division to Sleeper for full live stats.`}
-      </div>`;
+      <div class="alert info">${msg}</div>`;
     return;
   }
 
@@ -1299,6 +1468,14 @@ async function renderDivisionPage(app, league, divisions, divId){
       <button class="refresh-btn" id="liveRefreshBtn">Refresh now</button>
     </div>
     <div id="matchups"><div class="state-msg">Loading matchups…</div></div>
+
+    <div class="section-label">Injury Report</div>
+    <div id="injuryReport"><div class="state-msg">Loading injury report…</div></div>
+
+    <div class="section-label">Free Agents</div>
+    <div class="fa-controls" id="faControls"></div>
+    <div id="freeAgents"><div class="state-msg">Loading free agents…</div></div>
+
     <div class="section-label">Rosters</div>
     <div class="roster-cards" id="rosterCards"></div>
     <div class="section-label">Draft Order</div>
@@ -1321,11 +1498,146 @@ async function renderDivisionPage(app, league, divisions, divId){
   document.getElementById('liveRefreshBtn').addEventListener('click', ()=> tickLive(true));
   await loadDivisionWeek(division, currentWeek, byRoster, state);
 
-  await ensurePlayers();
+  await ensurePlayers(leagueSport(league).id);
   const startSlots = (info.roster_positions||[]).filter(p=>p!=='BN'&&p!=='IR'&&p!=='TAXI');
   document.getElementById('rosterCards').innerHTML = teams.map(t=>rosterCardHtml(t, startSlots)).join('');
 
+  renderInjuryReport(document.getElementById('injuryReport'), teams);
+  renderFreeAgents(division, teams, state);
+
   loadDraftOrder(division, teams);
+}
+
+/* ============================ INJURY REPORT ============================ */
+const INJURY_ORDER = { 'out':0, 'ir':1, 'injured reserve':1, 'pup':2, 'doubtful':3, 'questionable':4, 'sus':5, 'cov':6 };
+function injurySeverity(status){
+  const k = String(status||'').toLowerCase();
+  return INJURY_ORDER[k] != null ? INJURY_ORDER[k] : 7;
+}
+
+function renderInjuryReport(container, teams){
+  if(!container) return;
+  if(!sleeperCache.players){ container.innerHTML = `<div class="state-msg">Player data unavailable.</div>`; return; }
+
+  const rows = [];
+  teams.forEach(t=>{
+    const starters = new Set(t.starters||[]);
+    (t.players||[]).forEach(pid=>{
+      const p = sleeperCache.players[pid];
+      if(!p || !p.injury_status) return;
+      rows.push({
+        pid, team:t, player:p,
+        starter: starters.has(pid),
+        severity: injurySeverity(p.injury_status)
+      });
+    });
+  });
+
+  if(!rows.length){
+    container.innerHTML = `<div class="state-msg">No injuries reported across this division right now.</div>`;
+    return;
+  }
+
+  // Most serious first, and within that starters before bench.
+  rows.sort((a,b)=> a.severity-b.severity || (b.starter-a.starter) || a.team.teamName.localeCompare(b.team.teamName));
+
+  const counts = {};
+  rows.forEach(r=>{ const k=r.player.injury_status; counts[k]=(counts[k]||0)+1; });
+  const summary = Object.keys(counts).sort((a,b)=>injurySeverity(a)-injurySeverity(b))
+    .map(k=>`<span class="inj-chip">${escapeHtml(k)} <b>${counts[k]}</b></span>`).join('');
+
+  container.innerHTML = `
+    <div class="inj-summary">${summary}<span class="inj-total">${rows.length} affected player${rows.length===1?'':'s'}</span></div>
+    <div class="table-scroll"><table class="standings inj-table">
+      <thead><tr><th>Player</th><th>Status</th><th>Detail</th><th>Fantasy Team</th></tr></thead>
+      <tbody>${rows.map(r=>{
+        const p = r.player;
+        const detail = p.injury_body_part || (p.status && p.status!=='Active' ? p.status : '') || '—';
+        return `<tr>
+          <td><div class="inj-player">
+            <span class="rp-pos">${escapeHtml(p.position||'')}</span>
+            <span class="inj-name">${escapeHtml(playerDisplayName(p, r.pid))}</span>
+            ${r.starter?'<span class="inj-starter">Starter</span>':''}
+          </div><div class="inj-nfl">${escapeHtml(p.team||'FA')}</div></td>
+          <td>${injuryTag(p.injury_status)||escapeHtml(p.injury_status)}</td>
+          <td class="inj-detail">${escapeHtml(detail)}</td>
+          <td class="inj-team">${escapeHtml(r.team.teamName)}</td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table></div>`;
+}
+
+/* ============================ FREE AGENTS ============================
+   Anyone on an active roster in this Sleeper league is taken; everyone else
+   with a projection for the current week is available. Ranked by projected
+   points under this league's own scoring settings.                        */
+async function renderFreeAgents(division, teams, state){
+  const container = document.getElementById('freeAgents');
+  const controls = document.getElementById('faControls');
+  if(!container) return;
+
+  const info = divCache(division.id).info || {};
+  const scoring = info.scoring_settings;
+  const season = state.season, week = state.week;
+
+  let projTable;
+  try{
+    projTable = await ensureProjections(season, week);
+  }catch(e){
+    container.innerHTML = `<div class="state-msg">Couldn't load projections, so free agents can't be ranked right now.</div>`;
+    return;
+  }
+  if(!sleeperCache.players){ container.innerHTML = `<div class="state-msg">Player data unavailable.</div>`; return; }
+
+  const taken = new Set();
+  teams.forEach(t=>(t.players||[]).forEach(pid=>taken.add(pid)));
+
+  const available = [];
+  for(const pid in projTable){
+    if(taken.has(pid)) continue;
+    const p = sleeperCache.players[pid];
+    if(!p) continue;
+    if(!p.team) continue;                                  // not on an NFL roster
+    if(!PROJ_POSITIONS.includes(p.position)) continue;
+    const pts = projectedPoints(projTable[pid], scoring);
+    if(pts <= 0) continue;
+    available.push({ pid, player:p, proj:pts });
+  }
+  available.sort((a,b)=> b.proj - a.proj);
+
+  if(!available.length){
+    container.innerHTML = `<div class="state-msg">No free agents with a projection this week.</div>`;
+    return;
+  }
+
+  const positions = ['ALL', ...PROJ_POSITIONS.filter(pos=>available.some(a=>a.player.position===pos))];
+  controls.innerHTML = positions.map((pos,i)=>
+    `<button class="fa-tab ${i===0?'active':''}" data-pos="${pos}">${pos}</button>`).join('')
+    + `<span class="fa-note">Week ${week} projections &middot; ${available.length} available</span>`;
+
+  const LIMIT = 15;
+  function paint(pos){
+    const list = (pos==='ALL' ? available : available.filter(a=>a.player.position===pos)).slice(0, LIMIT);
+    container.innerHTML = `<div class="table-scroll"><table class="standings fa-table">
+      <thead><tr><th class="rank-cell"></th><th>Player</th><th>Team</th><th class="num">Proj</th><th>Status</th></tr></thead>
+      <tbody>${list.map((a,i)=>`<tr>
+        <td class="rank-cell">${i+1}</td>
+        <td><div class="inj-player"><span class="rp-pos">${escapeHtml(a.player.position||'')}</span>
+          <span class="inj-name">${escapeHtml(playerDisplayName(a.player, a.pid))}</span></div></td>
+        <td class="fa-nfl">${escapeHtml(a.player.team||'')}</td>
+        <td class="num fa-proj">${fmt1(a.proj)}</td>
+        <td>${injuryTag(a.player.injury_status)||'<span class="fa-healthy">&mdash;</span>'}</td>
+      </tr>`).join('')}</tbody>
+    </table></div>`;
+  }
+  controls.querySelectorAll('.fa-tab').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      controls.querySelectorAll('.fa-tab').forEach(b=>b.classList.remove('active'));
+      btn.classList.add('active');
+      paint(btn.dataset.pos);
+    });
+  });
+  paint('ALL');
 }
 
 async function loadDraftOrder(division, teams){
@@ -1469,7 +1781,15 @@ function matchupCardHtml(e1, e2, byRoster){
       ${t2?`<div class="mt-team right" data-role="team2">${avatarHtml(t2,'mt-avatar','mt-avatar-fallback')}
         <div class="mt-info"><div class="mt-team-name">${escapeHtml(t2.teamName)}</div><div class="mt-record">${t2.wins}-${t2.losses}</div></div></div>`:'<div></div>'}
     </div>
-    ${t2?`<div class="expand-row">Starters, projections &amp; health <span>&#9660;</span></div>
+    ${t2?`<div class="winbar-wrap" data-role="winbar">
+      <div class="winbar-head">
+        <span class="winbar-pct" data-role="wp1">—</span>
+        <span class="winbar-label">Win probability</span>
+        <span class="winbar-pct" data-role="wp2">—</span>
+      </div>
+      <div class="winbar"><div class="winbar-fill" data-role="wpfill"></div></div>
+    </div>
+    <div class="expand-row">Starters, projections &amp; health <span>&#9660;</span></div>
     <div class="roster-detail" data-t1="${escapeHtml(t1.teamName)}" data-t2="${escapeHtml(t2.teamName)}"></div>`:''}
   </div>`;
 }
@@ -1520,12 +1840,26 @@ function paintLive(container, division, season, week){
     if(team1) team1.classList.toggle('loser', !!(started && l2 && l1.actual < l2.actual));
     if(team2) team2.classList.toggle('loser', !!(started && l2.actual < l1.actual));
 
+    if(l2) paintWinBar(card, l1, l2);
+
     const detail = card.querySelector('.roster-detail');
     if(detail && l2) paintDetail(detail, l1, l2);
   });
 
   live.anyLive = anyLive;
   updateLiveStatus();
+}
+
+function paintWinBar(card, l1, l2){
+  const p = winProbability(l1, l2);
+  if(p == null) return;
+  setText(card.querySelector('[data-role="wp1"]'), formatWinPct(p));
+  setText(card.querySelector('[data-role="wp2"]'), formatWinPct(1-p));
+  const fill = card.querySelector('[data-role="wpfill"]');
+  if(fill) fill.style.width = (p*100).toFixed(1) + '%';
+  const wrap = card.querySelector('[data-role="winbar"]');
+  // Once nothing is left to play the number stops being a forecast.
+  if(wrap) wrap.classList.toggle('settled', teamSigma(l1) + teamSigma(l2) < 0.5);
 }
 
 function paintProjection(el, self, other){
