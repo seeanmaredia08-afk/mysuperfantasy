@@ -284,6 +284,7 @@
     .bracket-col{width:190px;}
   }
 </style>
+<link rel="stylesheet" href="hosted.css">
 </head>
 <body>
 <div id="app"></div>
@@ -334,40 +335,145 @@ const BUILTIN_LEAGUES = [{
 function builtinBySlug(slug){ return BUILTIN_LEAGUES.find(l=>l.slug===slug) || null; }
 function builtinById(id){ return BUILTIN_LEAGUES.find(l=>l.id===id) || null; }
 
-/* ============================ SESSION (in-memory only) ============================ */
-let session = null; // { access_token, user_id, email }
+/* ============================ SESSION ============================
+   Kept in localStorage so managers stay logged in across visits — a hosted
+   league is unusable if every reload logs you out. Access tokens expire after
+   an hour, so they're refreshed shortly before expiry using the refresh token. */
+const SESSION_KEY = 'leagueroom.session.v1';
+let session = null; // { access_token, refresh_token, expires_at, user_id, email }
 
 function decodeJwtSub(token){
   try{ const payload = JSON.parse(atob(token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/'))); return payload.sub; }
   catch(e){ return null; }
 }
 
+function saveSession(next){
+  session = next;
+  try{
+    if(next) localStorage.setItem(SESSION_KEY, JSON.stringify(next));
+    else localStorage.removeItem(SESSION_KEY);
+  }catch(e){ /* storage blocked — the session still lasts for this page view */ }
+}
+
+function loadSession(){
+  try{
+    const s = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
+    if(s && s.access_token && s.user_id) session = s;
+  }catch(e){ session = null; }
+}
+loadSession();
+
+function sessionFromAuth(data, fallbackEmail){
+  return {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token || null,
+    expires_at: Date.now() + (data.expires_in || 3600) * 1000,
+    user_id: (data.user && data.user.id) || decodeJwtSub(data.access_token),
+    email: (data.user && data.user.email) || fallbackEmail || ''
+  };
+}
+
+let sessionRefresh = null;
+async function ensureFreshSession(){
+  if(!session || !session.refresh_token) return;
+  if(session.expires_at && Date.now() < session.expires_at - 60000) return;
+  if(!sessionRefresh){
+    sessionRefresh = (async ()=>{
+      try{
+        const res = await fetch(SB_URL + '/auth/v1/token?grant_type=refresh_token', {
+          method:'POST', headers:{ apikey:SB_ANON, 'Content-Type':'application/json' },
+          body: JSON.stringify({ refresh_token: session.refresh_token })
+        });
+        if(!res.ok){ saveSession(null); return; }
+        saveSession(sessionFromAuth(await res.json(), session.email));
+      }catch(e){ /* offline — keep the old token and let the request report the failure */ }
+    })().finally(()=>{ sessionRefresh = null; });
+  }
+  await sessionRefresh;
+}
+
+function logOut(){
+  saveSession(null);
+  if(location.hash === '#/' || location.hash === '') render(); else location.hash = '#/';
+}
+
 /* ============================ SUPABASE HELPERS ============================ */
+/* Turns raw PostgREST / network failures into something a manager can act on. */
+function friendlyDbError(res, body){
+  const code = body && body.code;
+  const msg = (body && (body.message || body.msg || body.error_description)) || '';
+  if(code === 'PGRST202' || code === '42883' || /could not find the function/i.test(msg))
+    return 'The league database needs an update before this works. (Commissioner: run supabase/schema.sql in Supabase.)';
+  if(code === 'PGRST205' || code === '42P01' || /could not find the table/i.test(msg))
+    return 'The league database is missing tables. (Commissioner: run supabase/schema.sql in Supabase.)';
+  if(code === '42703' || /column .* does not exist/i.test(msg))
+    return 'The league database is out of date. (Commissioner: run supabase/schema.sql in Supabase.)';
+  if(res && res.status === 401) return 'Your login has expired. Log in again.';
+  return msg || 'Request failed';
+}
+
 async function sbFetch(path, opts={}){
+  await ensureFreshSession();
   const headers = { 'apikey': SB_ANON, 'Content-Type':'application/json', ...(opts.headers||{}) };
-  if(!headers.Authorization) headers.Authorization = 'Bearer ' + (session ? session.access_token : SB_ANON);
-  const res = await fetch(SB_URL + path, { ...opts, headers });
+  headers.Authorization = 'Bearer ' + (session ? session.access_token : SB_ANON);
+  let res;
+  try{
+    res = await fetch(SB_URL + path, { ...opts, headers });
+  }catch(e){
+    throw new Error("Can't reach the league database right now. Check your connection and try again.");
+  }
   if(!res.ok){
-    let msg = 'Request failed';
-    try{ const j = await res.json(); msg = j.message || j.msg || j.error_description || JSON.stringify(j); }catch(e){}
-    throw new Error(msg);
+    let body = null;
+    try{ body = await res.json(); }catch(e){}
+    if(res.status === 401 && session){ saveSession(null); }
+    throw new Error(friendlyDbError(res, body));
   }
   if(res.status===204) return null;
   const text = await res.text();
   return text ? JSON.parse(text) : null;
 }
 
-async function authSignUp(email, password){
-  const res = await fetch(SB_URL+'/auth/v1/signup', { method:'POST', headers:{'apikey':SB_ANON,'Content-Type':'application/json'}, body: JSON.stringify({email,password}) });
-  const data = await res.json();
-  if(!res.ok) throw new Error(data.msg || data.error_description || 'Could not create commissioner account');
+/* Every hosted-league read and write goes through a database function. */
+function rpc(name, args){
+  return sbFetch('/rest/v1/rpc/' + name, { method:'POST', body: JSON.stringify(args || {}) });
+}
+
+async function authRequest(path, body, fallbackMsg){
+  let res;
+  try{
+    res = await fetch(SB_URL + path, { method:'POST', headers:{'apikey':SB_ANON,'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  }catch(e){
+    throw new Error("Can't reach the login service right now. Check your connection and try again.");
+  }
+  let data = {};
+  try{ data = await res.json(); }catch(e){}
+  if(!res.ok) throw new Error(data.msg || data.error_description || data.message || fallbackMsg);
   return data;
 }
-async function authSignIn(email, password){
-  const res = await fetch(SB_URL+'/auth/v1/token?grant_type=password', { method:'POST', headers:{'apikey':SB_ANON,'Content-Type':'application/json'}, body: JSON.stringify({email,password}) });
-  const data = await res.json();
-  if(!res.ok) throw new Error(data.error_description || data.msg || 'Incorrect league name or password');
-  return data;
+function authSignUp(email, password){
+  return authRequest('/auth/v1/signup', {email, password}, 'Could not create that account.');
+}
+function authSignIn(email, password){
+  return authRequest('/auth/v1/token?grant_type=password', {email, password}, 'Incorrect email or password.');
+}
+
+/* Signs up, or logs in if the email already has an account. Returns the session. */
+async function signUpOrLogIn(email, password, displayName){
+  let data;
+  try{
+    data = await authSignUp(email, password);
+  }catch(err){
+    if(!/already|registered|exists/i.test(err.message)) throw err;
+    data = await authSignIn(email, password);
+  }
+  if(!data.access_token){
+    throw new Error('Check your email to confirm your account, then log in.');
+  }
+  saveSession(sessionFromAuth(data, email));
+  if(displayName){
+    try{ await rpc('set_display_name', { p_display_name: displayName }); }catch(e){ /* optional */ }
+  }
+  return session;
 }
 
 function slugify(s){ return s.toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-+$)/g,'').slice(0,60); }
@@ -449,7 +555,9 @@ function teamsForDivision(division){
       wins:s.wins||0, losses:s.losses||0, ties:s.ties||0,
       ptsFor:(s.fpts||0)+(s.fpts_decimal||0)/100, ptsAgainst:(s.fpts_against||0)+(s.fpts_against_decimal||0)/100,
       players:r.players||[], starters:r.starters||[], reserve:r.reserve||[],
-      divisionId:division.id, divisionName:division.name
+      divisionId:division.id, divisionName:division.name,
+      // Hosted divisions tag their owners "team:<id>" so playoff games can be scored.
+      hostedTeamId: String(r.owner_id||'').startsWith('team:') ? String(r.owner_id).slice(5) : null
     };
   });
 }
@@ -624,7 +732,9 @@ function startLive(ctx){
 function scheduleLive(){
   if(live.timer){ clearTimeout(live.timer); live.timer = null; }
   if(!live.ctx || !live.ctx.pollable) return;
-  live.timer = setTimeout(tickLive, live.anyLive ? LIVE_INTERVAL_ACTIVE : LIVE_INTERVAL_IDLE);
+  // A view can ask for its own cadence (a live draft polls every few seconds).
+  const interval = typeof live.ctx.interval === 'function' ? live.ctx.interval() : live.ctx.interval;
+  live.timer = setTimeout(tickLive, interval || (live.anyLive ? LIVE_INTERVAL_ACTIVE : LIVE_INTERVAL_IDLE));
 }
 
 async function tickLive(manual){
@@ -683,15 +793,33 @@ document.addEventListener('visibilitychange', ()=>{
 
 /* ============================ WIN PROBABILITY ============================
    Each team's final score is treated as a normal distribution centred on its
-   live projection. The spread comes only from points still to be scored: a
-   starter whose game is over contributes no uncertainty, one who hasn't kicked
-   off contributes a lot. Win probability is then P(A - B > 0).
+   live projection, and win probability is P(A - B > 0).
 
-   SCORE_VOLATILITY is the assumed standard deviation of a player's remaining
-   points as a fraction of those points. 0.6 is an approximation — weekly
-   fantasy scoring is genuinely noisy — so this is a useful signal, not a
-   precise forecast, and the UI says as much.                                */
-const SCORE_VOLATILITY = 0.6;
+   The spread is built per starter from two ideas:
+
+   1. Position-specific volatility. A full game's standard deviation is
+      cv × projection + base. Quarterbacks are steadier than receivers and
+      defenses are the noisiest; the base keeps a low projection from implying
+      near-certainty (a 4-point tight end can still catch two touchdowns).
+
+   2. Uncertainty shrinks with the square root of game time left, not linearly.
+      Scoring accrues like a random walk, so variance is proportional to time
+      remaining. The old linear decay called games far too early — Sleeper
+      rebuilt its own model specifically to stop premature "certain win/loss"
+      calls, so the sqrt decay is the closer match.
+
+   WINPROB_SPREAD scales every standard deviation at once, so the whole curve
+   can be calibrated against real Sleeper numbers with a single constant.   */
+const POSITION_VOLATILITY = {
+  QB:  { cv:0.40, base:1.5 },
+  RB:  { cv:0.60, base:1.5 },
+  WR:  { cv:0.65, base:1.5 },
+  TE:  { cv:0.70, base:1.5 },
+  K:   { cv:0.50, base:1.5 },
+  DEF: { cv:0.80, base:2.0 }
+};
+const DEFAULT_VOLATILITY = { cv:0.65, base:1.5 };
+const WINPROB_SPREAD = 1.0;
 
 /* Abramowitz & Stegun 7.1.26 — plenty accurate for a displayed percentage. */
 function normalCdf(z){
@@ -702,12 +830,17 @@ function normalCdf(z){
   return 0.5 * (1 + sign * y);
 }
 
+function playerSigma(r){
+  if(!r.pid || r.pid === '0' || !(r.frac > 0)) return 0;   // empty slot or game over
+  const p = sleeperCache.players && sleeperCache.players[r.pid];
+  const vol = POSITION_VOLATILITY[(p && p.position) || r.position] || DEFAULT_VOLATILITY;
+  const fullGameSd = vol.cv * Math.max(0, r.full || 0) + vol.base;
+  return WINPROB_SPREAD * fullGameSd * Math.sqrt(Math.min(1, r.frac));
+}
+
 function teamSigma(le){
   // Independent contributions, so variances add.
-  const variance = le.rows.reduce((sum,r)=>{
-    const remaining = r.full * r.frac;
-    return sum + Math.pow(SCORE_VOLATILITY * remaining, 2);
-  }, 0);
+  const variance = le.rows.reduce((sum,r)=> sum + Math.pow(playerSigma(r), 2), 0);
   return Math.sqrt(variance);
 }
 
@@ -726,6 +859,8 @@ function winProbability(l1, l2){
 
 function formatWinPct(p){
   if(p == null) return '';
+  if(p === 1) return '100%';   // decided: nothing left to play
+  if(p === 0) return '0%';
   if(p >= 0.9995) return '>99.9%';
   if(p <= 0.0005) return '<0.1%';
   if(p >= 0.995 || p <= 0.005) return (p*100).toFixed(1) + '%';
@@ -753,9 +888,10 @@ function route(){
   const query = {};
   if(queryPart) queryPart.split('&').forEach(pair=>{ const [k,v]=pair.split('='); query[k]=decodeURIComponent(v||''); });
   if(parts[0]==='create') return {view:'create'};
-  if(parts[0]==='account' || parts[0]==='commissioner') return {view:'account', returnCode: query.code||'', returnName: query.name||''};
+  if(parts[0]==='account' || parts[0]==='commissioner') return {view:'account', returnCode: query.code||'', returnName: query.name||'', next: query.next||''};
   if(parts[0]==='join') return {view:'join', code: query.code||'', name: query.name||''};
-  if(parts[0]==='league' && parts[1]) return {view:'league', slug:parts[1], sub:parts[2], arg:parts[3]};
+  if(parts[0]==='commish-invite') return {view:'commishInvite', code: query.code||''};
+  if(parts[0]==='league' && parts[1]) return {view:'league', slug:parts[1], sub:parts[2], arg:parts[3], tab:parts[4]};
   return {view:'landing'};
 }
 
@@ -766,8 +902,9 @@ async function render(){
   try{
     if(r.view==='landing') await renderLanding(app);
     else if(r.view==='create') await renderCreate(app);
-    else if(r.view==='account') await renderAccount(app, r.returnCode, r.returnName);
+    else if(r.view==='account') await renderAccount(app, r.returnCode, r.returnName, r.next);
     else if(r.view==='join') await renderJoin(app, r.code, r.name);
+    else if(r.view==='commishInvite') await renderCommishInvite(app, r.code);
     else if(r.view==='league') await renderLeagueRoute(app, r);
     focusActiveNav();
   }catch(err){
@@ -777,7 +914,9 @@ async function render(){
 }
 
 function topbarHtml(backHref, extra){
-  const accountLink = session ? `<a class="backlink" href="#/account">My Leagues</a>` : '';
+  const accountLinks = session
+    ? `<a class="backlink" href="#/account">My Leagues</a><button type="button" class="backlink" onclick="logOut()">Log Out</button>`
+    : `<a class="backlink" href="#/account?next=${encodeURIComponent(location.hash||'#/')}">Log In</a>`;
   return `<div class="topbar">
     <a class="brand" href="#/">
       <div class="brand-mark">LR</div>
@@ -785,10 +924,15 @@ function topbarHtml(backHref, extra){
     </a>
     <div class="topbar-actions">
       ${extra||''}
-      ${accountLink}
+      ${accountLinks}
       ${backHref?`<a class="backlink" href="${backHref}">&larr; Back</a>`:''}
     </div>
   </div>`;
+}
+
+/* Sends someone to log in, then back to where they were. */
+function loginHref(next){
+  return `#/account?next=${encodeURIComponent(next || location.hash || '#/')}`;
 }
 
 /* On narrow screens the sub-nav scrolls sideways, so bring the current tab into
@@ -807,6 +951,13 @@ function focusActiveNav(){
 function leagueNavHtml(league, divisions, active){
   const item = (href, label, key, cls) =>
     `<a href="${href}" class="${key===active?'active':''}${cls?' '+cls:''}">${escapeHtml(label)}</a>`;
+  if(league.format === 'single'){
+    // One division, no super league on top: the league page itself carries the tabs.
+    return `<div class="subnav">
+      ${item(`#/league/${league.slug}`, league.name, 'overview')}
+      ${session && session.user_id === league.commissioner_id ? item(`#/league/${league.slug}/manage`, 'Manage', 'manage') : ''}
+    </div>`;
+  }
   return `<div class="subnav">
     ${item(`#/league/${league.slug}`, 'Overview', 'overview')}
     ${(divisions||[]).map(d=>item(`#/league/${league.slug}/division/${d.id}`, d.name, 'div:'+d.id)).join('')}
@@ -820,7 +971,7 @@ async function renderLanding(app){
     <div class="hero">
       <div class="hero-eyebrow"><span class="dot-live"></span> LIVE LEAGUE HUB</div>
       <h1>Every division.<br>One league room.</h1>
-      <p>Bring together 2 to 16 fantasy divisions — from Sleeper, ESPN, Yahoo, or NFL.com — into one shared home. Live matchups, combined standings, and a playoff bracket that spans your whole group. Public leagues are searchable below; private ones need an invite code from the commissioner.</p>
+      <p>Run a fantasy football league right here — draft, lineups, waivers, trades and live scoring — or bring together 2 to 16 divisions into one super league, hosted here or pulled from Sleeper, ESPN, Yahoo, or NFL.com. Public leagues are searchable below; private ones need an invite link from the commissioner.</p>
     </div>
     <div class="search-bar">
       <input type="text" id="searchInput" placeholder="Search public leagues by name…" autocomplete="off">
@@ -839,7 +990,7 @@ async function renderLanding(app){
     <div class="action-row">
       <a class="action-card" href="#/create">
         <div class="ac-title">+ Create a League</div>
-        <div class="ac-sub">Set up your super league — divisions, playoff format, and a commissioner password.</div>
+        <div class="ac-sub">Host a single league here, or build a super league of 2–16 divisions.</div>
       </a>
       <a class="action-card" href="#/join">
         <div class="ac-title">Join a Private League</div>
@@ -851,7 +1002,7 @@ async function renderLanding(app){
       </a>
     </div>
 
-    <div class="footnote">Sleeper divisions sync live automatically. ESPN, Yahoo, and NFL.com support is rolling out — see each league page for details.</div>
+    <div class="footnote">Leagues hosted here and Sleeper divisions score live from NFL stats. ESPN, Yahoo, and NFL.com support is rolling out — see each league page for details.</div>
   `;
 
   const input = document.getElementById('searchInput');
@@ -889,231 +1040,16 @@ async function doSearch(q){
   }
 }
 
-/* ============================ CREATE LEAGUE ============================ */
-async function renderCreate(app){
-  app.innerHTML = topbarHtml('#/') + `
-    <div class="hero" style="margin:20px 0 20px;">
-      <h1 style="font-size:28px;">Create Your League</h1>
-      <p>Set up divisions, playoff rules, and a commissioner account. Only you'll be able to edit this once it's created.</p>
-    </div>
-    <div id="createAlert"></div>
-    <form id="createForm">
-      <div class="form-group">
-        <label class="form-label">League Name</label>
-        <input class="form-input" id="f_name" placeholder="e.g. The Maredia Super League" required>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Sport</label>
-        <div class="sport-picker" id="sportPicker">
-          ${SPORTS.map((s,i)=>`<button type="button" class="sport-opt ${i===0?'active':''}" data-sport="${s.id}">
-            <span class="sport-name">${escapeHtml(s.label)}</span>
-            <span class="sport-sub">${escapeHtml(s.sub)}</span>
-            ${s.live?'<span class="sport-live">Live sync</span>':''}
-          </button>`).join('')}
-        </div>
-        <div class="form-hint" id="sportHint"></div>
-      </div>
-      <div class="form-row2">
-        <div class="form-group">
-          <label class="form-label">Your Email</label>
-          <input class="form-input" id="f_email" type="email" placeholder="you@example.com" required>
-        </div>
-        <div class="form-group">
-          <label class="form-label">Commissioner Password</label>
-          <input class="form-input" id="f_password" type="password" placeholder="At least 6 characters" required>
-        </div>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Number of Divisions (2–16)</label>
-        <input class="form-input" id="f_numdiv" type="number" min="2" max="16" value="2" required>
-      </div>
-      <div class="form-row2">
-        <div class="form-group">
-          <label class="form-label">Playoff Length (weeks)</label>
-          <input class="form-input" id="f_playoffweeks" type="number" min="1" max="6" value="3" required>
-        </div>
-        <div class="form-group">
-          <label class="form-label">Teams Advancing to Playoffs</label>
-          <input class="form-input" id="f_advance" type="number" min="2" value="8" required>
-          <div class="form-hint">Total across the whole super league (e.g. top 4 from each of 2 divisions = 8)</div>
-        </div>
-      </div>
-      <div class="form-group">
-        <label class="form-label" style="display:flex;align-items:center;gap:8px;font-size:12.5px;">
-          <input type="checkbox" id="f_public" style="width:auto;"> Make this league publicly searchable
-        </label>
-        <div class="form-hint">Off by default — private leagues only appear via your invite link. On means anyone can find and browse it from the homepage search.</div>
-      </div>
-
-      <div class="section-label">Divisions</div>
-      <div id="divisionFields"></div>
-
-      <button type="submit" class="primary-btn" id="submitBtn" style="margin-top:10px;">Create League</button>
-    </form>
-  `;
-
-  let chosenSport = 'nfl';
-  const sportPicker = document.getElementById('sportPicker');
-  const sportHint = document.getElementById('sportHint');
-  function paintSportHint(){
-    const s = sportById(chosenSport);
-    sportHint.textContent = s.live
-      ? 'Live scoring, projections and injury data sync automatically for this sport.'
-      : `${s.label} leagues are saved and organised here, but live sync isn't available for ${s.sub} yet — scores need to be entered manually.`;
-  }
-  sportPicker.querySelectorAll('.sport-opt').forEach(btn=>{
-    btn.addEventListener('click', ()=>{
-      sportPicker.querySelectorAll('.sport-opt').forEach(b=>b.classList.remove('active'));
-      btn.classList.add('active');
-      chosenSport = btn.dataset.sport;
-      paintSportHint();
-    });
-  });
-  paintSportHint();
-
-  const numDivInput = document.getElementById('f_numdiv');
-  const fieldsEl = document.getElementById('divisionFields');
-  function renderDivisionFields(){
-    let n = parseInt(numDivInput.value)||2;
-    n = Math.max(2, Math.min(16, n));
-    numDivInput.value = n;
-    let html = '';
-    for(let i=0;i<n;i++){
-      html += `<div class="division-fields" data-idx="${i}">
-        <div class="division-fields-head">Division ${i+1}</div>
-        <div class="form-row2">
-          <div class="form-group"><label class="form-label">Division Name</label><input class="form-input dv-name" placeholder="e.g. North Division"></div>
-          <div class="form-group"><label class="form-label">Platform</label>
-            <select class="form-select dv-platform">
-              <option value="sleeper">Sleeper (live sync)</option>
-              <option value="espn">ESPN Fantasy</option>
-              <option value="yahoo">Yahoo Fantasy</option>
-              <option value="nfl">NFL.com Fantasy</option>
-              <option value="manual">Manual entry</option>
-            </select>
-          </div>
-        </div>
-        <div class="form-group dv-idfield"><label class="form-label">League ID</label><input class="form-input dv-extid" placeholder="Sleeper League ID"></div>
-        <div class="form-group dv-espnfields" style="display:none;">
-          <label class="form-label">ESPN Cookies (private leagues only)</label>
-          <div class="form-row2">
-            <input class="form-input dv-espn-s2" placeholder="espn_s2 value">
-            <input class="form-input dv-swid" placeholder="SWID value">
-          </div>
-          <div class="form-hint">Only needed for private ESPN leagues. Leave blank for public leagues. Stored securely — never shown to other visitors.</div>
-        </div>
-      </div>`;
-    }
-    fieldsEl.innerHTML = html;
-    fieldsEl.querySelectorAll('.division-fields').forEach(card=>{
-      const platformSel = card.querySelector('.dv-platform');
-      const idField = card.querySelector('.dv-idfield');
-      const espnFields = card.querySelector('.dv-espnfields');
-      const idInput = card.querySelector('.dv-extid');
-      function updatePlaceholder(){
-        const p = platformSel.value;
-        idField.style.display = p==='manual' ? 'none' : '';
-        espnFields.style.display = p==='espn' ? '' : 'none';
-        idInput.placeholder = p==='sleeper' ? 'Sleeper League ID' : p==='espn' ? 'ESPN League ID' : p==='yahoo' ? 'Yahoo League ID (manual sync for now)' : 'NFL.com League ID (manual sync for now)';
-      }
-      platformSel.addEventListener('change', updatePlaceholder);
-      updatePlaceholder();
-    });
-  }
-  numDivInput.addEventListener('change', renderDivisionFields);
-  renderDivisionFields();
-
-  document.getElementById('createForm').addEventListener('submit', async (e)=>{
-    e.preventDefault();
-    const alertEl = document.getElementById('createAlert');
-    const submitBtn = document.getElementById('submitBtn');
-    alertEl.innerHTML = '';
-
-    const name = document.getElementById('f_name').value.trim();
-    const email = document.getElementById('f_email').value.trim();
-    const password = document.getElementById('f_password').value;
-    const isPublic = document.getElementById('f_public').checked;
-    const numDiv = parseInt(numDivInput.value);
-    const playoffWeeks = parseInt(document.getElementById('f_playoffweeks').value);
-    const advance = parseInt(document.getElementById('f_advance').value);
-
-    if(!name || password.length<6){
-      alertEl.innerHTML = `<div class="alert error">Please enter a league name and a password of at least 6 characters.</div>`;
-      return;
-    }
-    if(!email || !email.includes('@')){
-      alertEl.innerHTML = `<div class="alert error">Please enter a valid email address.</div>`;
-      return;
-    }
-    const divisionCards = [...fieldsEl.querySelectorAll('.division-fields')];
-    const divisions = divisionCards.map((card,i)=>({
-      name: card.querySelector('.dv-name').value.trim() || `Division ${i+1}`,
-      platform: card.querySelector('.dv-platform').value,
-      external_league_id: card.querySelector('.dv-extid').value.trim() || null,
-      espn_s2: card.querySelector('.dv-espn-s2') ? card.querySelector('.dv-espn-s2').value.trim() : '',
-      swid: card.querySelector('.dv-swid') ? card.querySelector('.dv-swid').value.trim() : '',
-      sort_order: i
-    }));
-
-    submitBtn.disabled = true; submitBtn.textContent = 'Creating…';
-    try{
-      const slug = slugify(name) || ('league-' + Date.now());
-      if(slug.length < 2){ throw new Error('Please use a league name with at least a couple of letters or numbers.'); }
-
-      const authData = await authSignUp(email, password);
-      const token = authData.access_token;
-      const uid = authData.user ? authData.user.id : decodeJwtSub(token);
-      session = { access_token: token, user_id: uid, email };
-
-      const inviteCode = String(Math.floor(100000 + Math.random()*900000));
-
-      const baseRow = { name, slug, email, commissioner_id: uid, num_divisions:numDiv,
-        playoff_length_weeks:playoffWeeks, playoff_advance_count:advance,
-        invite_code: inviteCode, is_public: isPublic };
-
-      // `sport` is a newer column. If the database doesn't have it yet, retry
-      // without it rather than failing the whole league creation.
-      let leagueRows;
-      try{
-        leagueRows = await sbFetch('/rest/v1/leagues', {
-          method:'POST',
-          headers:{ Authorization:'Bearer '+token, Prefer:'return=representation' },
-          body: JSON.stringify({ ...baseRow, sport: chosenSport })
-        });
-      }catch(err){
-        if(!/sport/i.test(err.message||'')) throw err;
-        console.warn('leagues.sport column missing — saving without it.', err.message);
-        leagueRows = await sbFetch('/rest/v1/leagues', {
-          method:'POST',
-          headers:{ Authorization:'Bearer '+token, Prefer:'return=representation' },
-          body: JSON.stringify(baseRow)
-        });
-      }
-      const league = leagueRows[0];
-
-      const divRows = await sbFetch('/rest/v1/divisions', {
-        method:'POST',
-        headers:{ Authorization:'Bearer '+token, Prefer:'return=representation' },
-        body: JSON.stringify(divisions.map(d=>({ league_id:league.id, name:d.name, platform:d.platform, external_league_id:d.external_league_id, sort_order:d.sort_order })))
-      });
-
-      const espnInserts = divisions.map((d,i)=> d.platform==='espn' && d.espn_s2 && d.swid ? { division_id: divRows[i].id, espn_s2:d.espn_s2, swid:d.swid } : null).filter(Boolean);
-      if(espnInserts.length){
-        await sbFetch('/rest/v1/espn_credentials', { method:'POST', headers:{ Authorization:'Bearer '+token, Prefer:'return=minimal' }, body: JSON.stringify(espnInserts) });
-      }
-
-      location.hash = `#/league/${slug}/manage`;
-    }catch(err){
-      alertEl.innerHTML = `<div class="alert error">${escapeHtml(err.message)}</div>`;
-      submitBtn.disabled = false; submitBtn.textContent = 'Create League';
-    }
-  });
-}
 
 /* ============================ MY ACCOUNT (login for commissioners & members) ============================ */
-async function renderAccount(app, returnCode, returnName){
+async function renderAccount(app, returnCode, returnName, next){
+  // Where to go once logged in: a pending join, an explicit destination, or My Leagues.
+  const destination = returnCode
+    ? `#/join?code=${encodeURIComponent(returnCode)}&name=${encodeURIComponent(returnName||'')}`
+    : (next && next.startsWith('#/') && !next.startsWith('#/account') ? next : '');
+
   if(session){
-    if(returnCode){ location.hash = `#/join?code=${encodeURIComponent(returnCode)}&name=${encodeURIComponent(returnName||'')}`; return; }
+    if(destination){ location.hash = destination; return; }
     await renderMyLeagues(app, session.user_id);
     return;
   }
@@ -1121,7 +1057,7 @@ async function renderAccount(app, returnCode, returnName){
   app.innerHTML = topbarHtml('#/') + `
     <div class="hero" style="margin:20px 0 20px;">
       <h1 style="font-size:28px;">Sign Up / Log In</h1>
-      <p>${returnCode ? "Create an account or log in, then we'll bring you right back to finish joining your league." : "One account gets you into every league you're in — commissioner or member."}</p>
+      <p>${destination ? "Create an account or log in, then we'll bring you right back." : "One account gets you into every league you're in — commissioner or member."}</p>
     </div>
     <div class="tabs-row">
       <button class="tab-btn active" id="tabLogin">Log In</button>
@@ -1130,14 +1066,15 @@ async function renderAccount(app, returnCode, returnName){
     <div id="accountAlert"></div>
 
     <form id="loginForm" style="max-width:420px;">
-      <div class="form-group"><label class="form-label">Email</label><input class="form-input" type="email" id="l_email" required></div>
-      <div class="form-group"><label class="form-label">Password</label><input class="form-input" type="password" id="l_password" required></div>
+      <div class="form-group"><label class="form-label">Email</label><input class="form-input" type="email" id="l_email" autocomplete="email" required></div>
+      <div class="form-group"><label class="form-label">Password</label><input class="form-input" type="password" id="l_password" autocomplete="current-password" required></div>
       <button type="submit" class="primary-btn" id="loginBtn">Log In</button>
     </form>
 
     <form id="signupForm" style="max-width:420px;display:none;">
-      <div class="form-group"><label class="form-label">Email</label><input class="form-input" type="email" id="s_email" required></div>
-      <div class="form-group"><label class="form-label">Password</label><input class="form-input" type="password" id="s_password" placeholder="At least 6 characters" required></div>
+      <div class="form-group"><label class="form-label">Display Name</label><input class="form-input" id="s_name" maxlength="30" placeholder="What leaguemates will see" autocomplete="nickname" required></div>
+      <div class="form-group"><label class="form-label">Email</label><input class="form-input" type="email" id="s_email" autocomplete="email" required></div>
+      <div class="form-group"><label class="form-label">Password</label><input class="form-input" type="password" id="s_password" placeholder="At least 6 characters" autocomplete="new-password" required></div>
       <button type="submit" class="primary-btn" id="signupBtn">Create Account</button>
     </form>
   `;
@@ -1157,9 +1094,9 @@ async function renderAccount(app, returnCode, returnName){
     document.getElementById('accountAlert').innerHTML='';
   });
 
-  async function afterAuth(uid, email){
-    if(returnCode){ location.hash = `#/join?code=${encodeURIComponent(returnCode)}&name=${encodeURIComponent(returnName||'')}`; return; }
-    await renderMyLeagues(app, uid);
+  async function afterAuth(){
+    if(destination){ location.hash = destination; return; }
+    await renderMyLeagues(app, session.user_id);
   }
 
   loginForm.addEventListener('submit', async (e)=>{
@@ -1171,10 +1108,8 @@ async function renderAccount(app, returnCode, returnName){
     const password = document.getElementById('l_password').value;
     btn.disabled = true; btn.textContent = 'Logging in…';
     try{
-      const data = await authSignIn(email, password);
-      const uid = decodeJwtSub(data.access_token);
-      session = { access_token:data.access_token, user_id: uid, email };
-      await afterAuth(uid, email);
+      saveSession(sessionFromAuth(await authSignIn(email, password), email));
+      await afterAuth();
     }catch(err){
       alertEl.innerHTML = `<div class="alert error">${escapeHtml(err.message)}</div>`;
       btn.disabled = false; btn.textContent = 'Log In';
@@ -1186,15 +1121,15 @@ async function renderAccount(app, returnCode, returnName){
     const alertEl = document.getElementById('accountAlert');
     const btn = document.getElementById('signupBtn');
     alertEl.innerHTML='';
+    const displayName = document.getElementById('s_name').value.trim();
     const email = document.getElementById('s_email').value.trim();
     const password = document.getElementById('s_password').value;
+    if(displayName.length < 2){ alertEl.innerHTML = `<div class="alert error">Pick a display name of at least 2 characters.</div>`; return; }
     if(!email || password.length<6){ alertEl.innerHTML = `<div class="alert error">Please enter a valid email and a password of at least 6 characters.</div>`; return; }
     btn.disabled = true; btn.textContent = 'Creating account…';
     try{
-      const data = await authSignUp(email, password);
-      const uid = data.user ? data.user.id : decodeJwtSub(data.access_token);
-      session = { access_token:data.access_token, user_id: uid, email };
-      await afterAuth(uid, email);
+      await signUpOrLogIn(email, password, displayName);
+      await afterAuth();
     }catch(err){
       alertEl.innerHTML = `<div class="alert error">${escapeHtml(err.message)}</div>`;
       btn.disabled = false; btn.textContent = 'Create Account';
@@ -1241,16 +1176,20 @@ async function renderMyLeagues(app, uid){
 }
 
 /* ============================ LEAGUE ROUTING ============================ */
+// Secret columns (invite codes, email) aren't readable, so never select "*".
+const LEAGUE_COLUMNS = 'id,name,slug,commissioner_id,num_divisions,playoff_length_weeks,playoff_advance_count,is_public,finalized,created_at,sport,format,hosting';
+const DIVISION_COLUMNS = 'id,league_id,name,platform,external_league_id,sort_order,commissioner_id';
+
 async function getLeagueBySlug(slug){
   const builtin = builtinBySlug(slug);
   if(builtin) return builtin;
-  const rows = await sbFetch(`/rest/v1/leagues?slug=eq.${encodeURIComponent(slug)}&select=*`);
+  const rows = await sbFetch(`/rest/v1/leagues?slug=eq.${encodeURIComponent(slug)}&select=${LEAGUE_COLUMNS}`);
   return rows && rows[0] ? rows[0] : null;
 }
 async function getDivisions(leagueId){
   const builtin = builtinById(leagueId);
   if(builtin) return builtin.divisions;
-  return sbFetch(`/rest/v1/divisions?league_id=eq.${leagueId}&select=*&order=sort_order.asc`);
+  return sbFetch(`/rest/v1/divisions?league_id=eq.${leagueId}&select=${DIVISION_COLUMNS}&order=sort_order.asc`);
 }
 
 async function renderLeagueRoute(app, r){
@@ -1258,17 +1197,23 @@ async function renderLeagueRoute(app, r){
   const league = await getLeagueBySlug(r.slug);
   if(!league){
     app.innerHTML = topbarHtml('#/') + `
-      <div class="alert info">This league doesn't exist, or it's private and you haven't joined it yet.</div>
+      <div class="alert info">This league doesn't exist, or it's private and you haven't joined it yet.${session ? '' : ` If you're a member, <a href="${loginHref()}" style="text-decoration:underline;">log in</a> first.`}</div>
       <a class="action-card" href="#/join" style="display:block;max-width:360px;">
         <div class="ac-title">Join a Private League</div>
-        <div class="ac-sub">Enter the invite code and PIN your commissioner shared with you.</div>
+        <div class="ac-sub">Enter the invite code your commissioner shared with you.</div>
       </a>`;
     return;
   }
   const divisions = await getDivisions(league.id);
 
-  if(r.sub==='division' && r.arg) return renderDivisionPage(app, league, divisions, r.arg);
+  if(r.sub==='superbracket') return renderSuperBracketPage(app, league, divisions);
   if(r.sub==='manage') return renderManage(app, league, divisions);
+  // A single-division league has no overview of its own: the league is the division.
+  if(league.format === 'single' && divisions.length){
+    const tab = r.sub==='division' ? r.tab : r.sub;
+    return renderHostedDivision(app, league, divisions, divisions[0], tab);
+  }
+  if(r.sub==='division' && r.arg) return renderDivisionPage(app, league, divisions, r.arg, r.tab);
   return renderLeagueHome(app, league, divisions);
 }
 
@@ -1314,11 +1259,7 @@ async function renderJoin(app, prefillCode, prefillName){
     const code = document.getElementById('j_code').value.trim();
     btn.disabled = true; btn.textContent = 'Joining…';
     try{
-      const slug = await sbFetch('/rest/v1/rpc/join_league_by_code', {
-        method:'POST',
-        headers:{ Authorization:'Bearer '+session.access_token },
-        body: JSON.stringify({ p_code: code, p_name: name })
-      });
+      const slug = await rpc('join_league_by_code', { p_code: code, p_name: name });
       location.hash = `#/league/${slug}`;
     }catch(err){
       alertEl.innerHTML = `<div class="alert error">${escapeHtml(err.message)}</div>`;
@@ -1327,7 +1268,7 @@ async function renderJoin(app, prefillCode, prefillName){
   });
 }
 
-const platformLabel = { sleeper:'Sleeper', espn:'ESPN', yahoo:'Yahoo', nfl:'NFL.com', manual:'Manual' };
+const platformLabel = { sleeper:'Sleeper', espn:'ESPN', yahoo:'Yahoo', nfl:'NFL.com', manual:'Manual', hosted:'Hosted here' };
 
 /* ============================ LEAGUE HOME ============================ */
 async function renderLeagueHome(app, league, divisions){
@@ -1365,7 +1306,7 @@ async function renderLeagueHome(app, league, divisions){
   await loadAllSleeperTeams(divisions);
   paintStandings();
 
-  const hasSleeper = divisions.some(d=>d.platform==='sleeper' && d.external_league_id);
+  const hasSleeper = divisions.some(d=>(d.platform==='sleeper' && d.external_league_id) || d.platform==='hosted');
   document.getElementById('liveRefreshBtn').addEventListener('click', ()=> tickLive(true));
   startLive({
     anchor: document.getElementById('superStandings'),
@@ -1385,9 +1326,13 @@ async function renderLeagueHome(app, league, divisions){
 }
 
 async function loadAllSleeperTeams(divisions, force){
-  const sleeperDivs = divisions.filter(d=>d.platform==='sleeper' && d.external_league_id);
-  await Promise.all(sleeperDivs.map(async d=>{
-    try{ await ensureSleeperBasics(d, force); }catch(e){ /* ignore individual failures */ }
+  const liveDivs = divisions.filter(d=>(d.platform==='sleeper' && d.external_league_id) || d.platform==='hosted');
+  await Promise.all(liveDivs.map(async d=>{
+    try{
+      // Hosted divisions are shaped into the same cache so standings and the bracket treat them alike.
+      if(d.platform==='hosted') await ensureHostedBasics(d, force);
+      else await ensureSleeperBasics(d, force);
+    }catch(e){ /* ignore individual failures */ }
   }));
 }
 
@@ -1422,9 +1367,10 @@ function renderStandingsTable(container, teams, showLeaders){
 }
 
 /* ============================ DIVISION PAGE (Sleeper) ============================ */
-async function renderDivisionPage(app, league, divisions, divId){
+async function renderDivisionPage(app, league, divisions, divId, tab){
   const division = divisions.find(d=>d.id===divId);
   if(!division){ app.innerHTML = topbarHtml(`#/league/${league.slug}`) + `<div class="state-msg error">Division not found.</div>`; return; }
+  if(division.platform === 'hosted') return renderHostedDivision(app, league, divisions, division, tab);
 
   const sport = leagueSport(league);
   if(division.platform !== 'sleeper' || !division.external_league_id || !sport.live){
@@ -1950,59 +1896,117 @@ async function computeSuperBracket(league, divisions){
   }).filter(g=>g.length);
   if(!groups.length) return null;
 
-  const leaders = groups.map(g=>g[0]).sort(compareTeams);
-  const rest = groups.flatMap(g=>g.slice(1)).sort(compareTeams);
-  const advanceCount = Math.min(league.playoff_advance_count || 8, leaders.length + rest.length);
-  const ordered = [...leaders, ...rest].slice(0, advanceCount);
+  // A single-division league seeds purely by record; a super league puts each division winner first.
+  let ordered;
+  if(groups.length === 1){
+    ordered = groups[0].slice();
+  }else{
+    const leaders = groups.map(g=>g[0]).sort(compareTeams);
+    const rest = groups.flatMap(g=>g.slice(1)).sort(compareTeams);
+    ordered = [...leaders, ...rest];
+  }
+  const advanceCount = Math.min(league.playoff_advance_count || 8, ordered.length);
+  ordered = ordered.slice(0, advanceCount);
   const bracketSize = nextPow2(ordered.length);
   const seeds = ordered.map((t,i)=>({...t, seed:i+1}));
-  const byes = [];
-  while(seeds.length < bracketSize) seeds.push(null); // padding, handled as byes below
 
-  const realSeeds = seeds.filter(Boolean);
-  let pairsForRound = reseedPair(realSeeds);
+  // When every division is hosted here, playoff rounds are real games: round N is
+  // the Nth NFL week after the latest regular season ends.
+  const hostedCtxs = divisions.map(d=> divCache(d.id).hosted).filter(Boolean);
+  const allHosted = hostedCtxs.length === divisions.length && hostedCtxs.length > 0 && typeof resolveHostedPlayoffGame === 'function';
+  const firstPlayoffWeek = allHosted
+    ? Math.max(...hostedCtxs.map(h=> h.ctx.settings.start_week + h.ctx.settings.regular_season_weeks))
+    : null;
+
+  let pairsForRound = reseedPair(seeds);
   const totalRounds = Math.log2(bracketSize);
   const roundLabels = totalRounds<=1?['Championship']:totalRounds===2?['Semifinals','Championship']:totalRounds===3?['Quarterfinals','Semifinals','Championship']:['Round 1','Round 2','Quarterfinals','Semifinals','Championship'].slice(-totalRounds);
 
   const rounds = [];
+  let settledSoFar = allHosted;
   for(let r=0;r<totalRounds;r++){
-    const results = pairsForRound.map(([a,b])=>{
+    const week = allHosted ? firstPlayoffWeek + r : null;
+    const results = await Promise.all(pairsForRound.map(async ([a,b])=>{
       if(!b) return {a, b:null, winner:a, bye:true};
+      let game = null;
+      if(allHosted && settledSoFar){
+        try{ game = await resolveHostedPlayoffGame(a, b, week); }catch(e){ game = null; }
+      }
+      if(game) return { a, b, winner: game.winner, bye:false, scoreA: game.scoreA, scoreB: game.scoreB, final: game.final, live: !game.final };
       const winner = compareTeams(a,b)<=0 ? a : b;
       return {a,b,winner,bye:false};
-    });
-    rounds.push({label:roundLabels[r], results});
-    let advancing = results.map(res=>res.winner).sort((x,y)=>x.seed-y.seed);
+    }));
+    // Once a round isn't final, later rounds can only be projected.
+    if(results.some(x=> !x.bye && !x.final)) settledSoFar = false;
+    rounds.push({label:roundLabels[r], week, results});
+    const advancing = results.map(res=>res.winner).sort((x,y)=>x.seed-y.seed);
     pairsForRound = reseedPair(advancing);
   }
-  return { rounds, champion: rounds[rounds.length-1].results[0].winner };
+  const lastGame = rounds[rounds.length-1].results[0];
+  return { rounds, champion: lastGame.winner, championFinal: !!lastGame.final, allHosted };
 }
 
-async function renderSuperBracketPage(app, league, divisions){
-  app.innerHTML = topbarHtml(`#/league/${league.slug}`)
-    + leagueNavHtml(league, divisions, 'bracket') + `
-    <div class="hero" style="margin:10px 0 4px;"><h1 style="font-size:28px;">&#9819; Super League Playoffs</h1></div>
-    <div class="alert info">Top ${league.playoff_advance_count} teams across all ${divisions.length} divisions. Each division's #1 seed locks into the top seeds; the rest are ranked by record. Every round, lowest surviving seed plays highest surviving seed. This is a projection — divisions run as separate leagues, so cross-division games aren't live-tracked.</div>
-    <div id="bracketBody"><div class="state-msg">Building bracket…</div></div>
-  `;
+/* Draws the bracket into any container — the super league page and a single league's Playoffs tab share it. */
+async function renderBracketInto(body, league, divisions){
   const result = await computeSuperBracket(league, divisions);
-  const body = document.getElementById('bracketBody');
-  if(!result){ body.innerHTML = `<div class="state-msg">Add Sleeper divisions with valid league IDs to build a bracket.</div>`; return; }
+  if(!result){ body.innerHTML = `<div class="state-msg">Add divisions with live data to build a bracket.</div>`; return; }
+  const sameTeam = (x,y)=> x && y && x.roster_id===y.roster_id && x.divisionId===y.divisionId;
   body.innerHTML = `<div class="bracket-scroll">${result.rounds.map(round=>{
     const pairs = round.results.map(res=>{
       if(res.bye) return `<div class="bracket-pair"><div class="bye-slot">Seed ${res.a.seed} &middot; ${escapeHtml(res.a.teamName)} — Bye</div></div>`;
-      const aWin = res.winner.roster_id===res.a.roster_id && res.winner.divisionId===res.a.divisionId;
+      const aWin = sameTeam(res.winner, res.a);
+      const scored = res.scoreA != null;
+      const tag = scored ? (res.final ? '' : `<div class="bracket-live">Live</div>`) : '';
       return `<div class="bracket-pair">
-        <div class="bracket-slot ${aWin?'winner':'loser'}"><span class="bseed">${res.a.seed}</span><span class="bname">${escapeHtml(res.a.teamName)}</span></div>
-        <div class="bracket-slot ${!aWin?'winner':'loser'}"><span class="bseed">${res.b.seed}</span><span class="bname">${escapeHtml(res.b.teamName)}</span></div>
+        <div class="bracket-slot ${aWin?'winner':'loser'}"><span class="bseed">${res.a.seed}</span><span class="bname">${escapeHtml(res.a.teamName)}</span>${scored?`<span class="bscore num">${fmt1(res.scoreA)}</span>`:''}</div>
+        <div class="bracket-slot ${!aWin?'winner':'loser'}"><span class="bseed">${res.b.seed}</span><span class="bname">${escapeHtml(res.b.teamName)}</span>${scored?`<span class="bscore num">${fmt1(res.scoreB)}</span>`:''}</div>
+        ${tag}
       </div>`;
     }).join('');
-    return `<div class="bracket-col"><div class="bracket-col-head">${round.label}</div>${pairs}</div>`;
+    return `<div class="bracket-col"><div class="bracket-col-head">${round.label}${round.week?` &middot; Wk ${round.week}`:''}</div>${pairs}</div>`;
   }).join('')}</div>
-  <div class="champion-box"><div class="champion-label">Projected Champion</div><div class="champion-name">&#127942; ${escapeHtml(result.champion.teamName)}</div></div>`;
+  <div class="champion-box"><div class="champion-label">${result.championFinal ? 'Champion' : 'Projected Champion'}</div><div class="champion-name">&#127942; ${escapeHtml(result.champion.teamName)}</div></div>`;
+}
+
+async function renderSuperBracketPage(app, league, divisions){
+  const hosted = league.hosting === 'hosted';
+  app.innerHTML = topbarHtml(`#/league/${league.slug}`)
+    + leagueNavHtml(league, divisions, 'bracket') + `
+    <div class="hero" style="margin:10px 0 4px;"><h1 style="font-size:28px;">&#9819; Super League Playoffs</h1></div>
+    <div class="alert info">Top ${league.playoff_advance_count} teams across all ${divisions.length} divisions. Each division's #1 seed locks into the top seeds; the rest are ranked by record. Every round, lowest surviving seed plays highest surviving seed.
+      ${hosted ? 'Every division is hosted here, so playoff games are scored for real — one NFL week per round. Rounds that haven\'t started are projected from records.' : 'This is a projection — divisions run as separate leagues, so cross-division games aren\'t live-tracked.'}</div>
+    <div id="bracketBody"><div class="state-msg">Building bracket…</div></div>
+  `;
+  await renderBracketInto(document.getElementById('bracketBody'), league, divisions);
 }
 
 /* ============================ MANAGE (commissioner) ============================ */
+function inviteLinkFor(league, code){
+  return `${location.origin}${location.pathname}#/join?code=${encodeURIComponent(code)}&name=${encodeURIComponent(league.name)}`;
+}
+function commishInviteLinkFor(code){
+  return `${location.origin}${location.pathname}#/commish-invite?code=${encodeURIComponent(code)}`;
+}
+
+/* A read-only field with a copy button — the easiest way to hand out a link. */
+function copyFieldHtml(value, label){
+  return `<div class="copy-field">
+    <input class="form-input" readonly value="${escapeHtml(value)}" aria-label="${escapeHtml(label||'Link')}">
+    <button type="button" class="secondary-btn copy-btn" data-copy="${escapeHtml(value)}">Copy</button>
+  </div>`;
+}
+function wireCopyButtons(root){
+  root.querySelectorAll('.copy-btn').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const input = btn.previousElementSibling;
+      try{ await navigator.clipboard.writeText(btn.dataset.copy); }
+      catch(e){ input.select(); if(document.execCommand) document.execCommand('copy'); }
+      btn.textContent = 'Copied';
+      setTimeout(()=>{ btn.textContent = 'Copy'; }, 1600);
+    });
+  });
+}
+
 async function renderManage(app, league, divisions){
   if(league.builtin){
     app.innerHTML = topbarHtml(`#/league/${league.slug}`)
@@ -2012,85 +2016,184 @@ async function renderManage(app, league, divisions){
   }
   const isCommish = session && session.user_id === league.commissioner_id;
   if(!isCommish){
-    app.innerHTML = topbarHtml(`#/league/${league.slug}`) + `<div class="alert info">You need to log in as this league's commissioner to manage it. <a href="#/account" style="text-decoration:underline;">Log in here</a>.</div>`;
+    app.innerHTML = topbarHtml(`#/league/${league.slug}`) + (session
+      ? `<div class="alert info">Only the league commissioner can manage this league.</div>`
+      : `<div class="alert info">You need to log in as this league's commissioner to manage it. <a href="${loginHref()}" style="text-decoration:underline;">Log in here</a>.</div>`);
     return;
   }
-  const joinLink = `${location.origin}${location.pathname}#/join?code=${league.invite_code}&name=${encodeURIComponent(league.name)}`;
+
+  app.innerHTML = topbarHtml(`#/league/${league.slug}`)
+    + leagueNavHtml(league, divisions, 'manage')
+    + `<div class="state-msg">Loading league settings…</div>`;
+  let admin;
+  try{
+    admin = await rpc('get_league_admin', { p_league_id: league.id });
+  }catch(e){
+    app.innerHTML = topbarHtml(`#/league/${league.slug}`) + leagueNavHtml(league, divisions, 'manage')
+      + `<div class="alert error">${escapeHtml(e.message)}</div>`;
+    return;
+  }
+
+  const hosted = league.hosting === 'hosted';
+  const isSuper = league.format !== 'single';
+  const byId = {};
+  (admin.divisions||[]).forEach(d=>{ byId[d.id] = d; });
+
+  const divisionCards = divisions.map(d=>{
+    const a = byId[d.id] || {};
+    if(!hosted){
+      return `<div class="division-fields">
+        <div class="division-fields-head">${escapeHtml(d.name)} &middot; ${platformLabel[d.platform]||d.platform}</div>
+        <div class="form-hint">League ID: ${escapeHtml(d.external_league_id||'—')}</div>
+      </div>`;
+    }
+    const divHref = isSuper ? `#/league/${league.slug}/division/${d.id}` : `#/league/${league.slug}`;
+    let commish = '';
+    if(isSuper){
+      if(a.commissioner_id){
+        commish = `<div class="manage-commish">
+          <span>Division commissioner: <b>${escapeHtml(a.commissioner_name || 'Assigned')}</b></span>
+          <button type="button" class="ghost-btn" data-remove-commish="${d.id}">Remove</button>
+        </div>`;
+      }else if(a.commish_invite_code){
+        commish = `<div class="form-hint" style="margin-bottom:6px;">Send this link to the person who'll run this division. It works once.</div>
+          ${copyFieldHtml(commishInviteLinkFor(a.commish_invite_code), d.name + ' commissioner invite')}
+          <button type="button" class="ghost-btn" data-new-commish="${d.id}" style="margin-top:6px;">Make a new link</button>`;
+      }else{
+        commish = `<div class="manage-commish"><span class="form-hint">You're running this division yourself.</span>
+          <button type="button" class="secondary-btn" data-new-commish="${d.id}">Invite a division commissioner</button></div>`;
+      }
+    }
+    return `<div class="division-fields">
+      <div class="division-fields-head" style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+        <span>${escapeHtml(d.name)} &middot; ${a.teams_claimed||0}/${a.teams_total||0} teams claimed</span>
+        <a href="${divHref}" class="ghost-btn">Open &rarr;</a>
+      </div>
+      ${commish}
+    </div>`;
+  }).join('');
+
   app.innerHTML = topbarHtml(`#/league/${league.slug}`)
     + leagueNavHtml(league, divisions, 'manage') + `
     <div class="hero" style="margin:10px 0 4px;"><h1 style="font-size:28px;">Manage: ${escapeHtml(league.name)}</h1>
-      <p><span class="commish-badge">&#9819; Commissioner</span> ${league.finalized ? `<span class="lock-badge">&#128274; Finalized</span>` : ''} ${league.is_public ? `<span class="lock-badge">&#127760; Public</span>` : `<span class="lock-badge">&#128274; Private</span>`}</p>
+      <p><span class="commish-badge">&#9819; Commissioner</span> ${league.finalized ? `<span class="lock-badge">&#128274; Finalized</span>` : ''} ${league.is_public ? `<span class="lock-badge">&#127760; Public</span>` : `<span class="lock-badge">&#128274; Private</span>`} <span class="lock-badge">${hosted ? 'Hosted on League Room' : 'Connected apps'}</span></p>
     </div>
     <div id="manageAlert"></div>
 
     <div class="section-label">Invite Your League</div>
-    <div class="alert info">
-      <b>Invite Code:</b> ${escapeHtml(league.invite_code)}<br>
-      <span style="font-size:12px;">Members enter this code along with your exact league name to join. Share this link and both are filled in automatically: ${escapeHtml(joinLink)}</span>
+    <div class="division-fields">
+      <div class="form-hint" style="margin-bottom:8px;">Invite code <b>${escapeHtml(admin.invite_code)}</b> &middot; ${admin.member_count} member${admin.member_count===1?'':'s'} so far. This link fills in the league name and code automatically${hosted ? ' — new members then claim an open team' : ''}.</div>
+      ${copyFieldHtml(inviteLinkFor(league, admin.invite_code), 'League invite link')}
     </div>
 
     <div class="section-label">League Settings</div>
     <div class="form-row2">
       <div class="form-group"><label class="form-label">Playoff Length (weeks)</label><input class="form-input" id="m_playoffweeks" type="number" min="1" max="6" value="${league.playoff_length_weeks}"></div>
-      <div class="form-group"><label class="form-label">Teams Advancing to Playoffs</label><input class="form-input" id="m_advance" type="number" min="2" value="${league.playoff_advance_count}"></div>
+      <div class="form-group"><label class="form-label">Teams Advancing to Playoffs</label><input class="form-input" id="m_advance" type="number" min="2" max="64" value="${league.playoff_advance_count}"></div>
     </div>
     <div class="form-group">
       <label class="form-label" style="display:flex;align-items:center;gap:8px;font-size:12.5px;">
-        <input type="checkbox" id="m_public" style="width:auto;" ${league.is_public?'checked':''}> Publicly searchable
+        <input type="checkbox" id="m_public" style="width:auto;" ${league.is_public?'checked':''}> Publicly searchable${hosted ? ' — anyone logged in can claim an open team' : ''}
       </label>
     </div>
     <button class="primary-btn" id="saveSettingsBtn">Save Settings</button>
-    <button class="secondary-btn" id="finalizeBtn" style="margin-left:8px;">${league.finalized?'Marked as Finalized':'Mark League as Finalized'}</button>
+    <button class="secondary-btn" id="finalizeBtn" style="margin-left:8px;" ${league.finalized?'disabled':''}>${league.finalized?'Marked as Finalized':'Mark League as Finalized'}</button>
 
-    <div class="section-label">Divisions</div>
-    <div id="manageDivisions">${divisions.map(d=>`<div class="division-fields">
-      <div class="division-fields-head">${escapeHtml(d.name)} &middot; ${platformLabel[d.platform]}</div>
-      <div class="form-hint">League ID: ${escapeHtml(d.external_league_id||'—')}</div>
-    </div>`).join('')}</div>
-
-    <div class="section-label">Members</div>
-    <div id="membersList"><div class="state-msg">Loading members…</div></div>
+    <div class="section-label">${isSuper ? 'Divisions' : 'League'}</div>
+    <div id="manageDivisions">${divisionCards}</div>
+    ${hosted ? `<div class="footnote" style="text-align:left;">Draft order, pick timer, waivers and team management live inside each ${isSuper ? 'division' : 'league'}'s Settings tab.</div>` : ''}
   `;
+  wireCopyButtons(app);
 
-  sbFetch(`/rest/v1/league_members?league_id=eq.${league.id}&select=id,joined_at`, { headers:{Authorization:'Bearer '+session.access_token} })
-    .then(rows=>{
-      const el = document.getElementById('membersList');
-      if(!rows || !rows.length){ el.innerHTML = `<div class="state-msg">No members have joined via invite yet.</div>`; return; }
-      el.innerHTML = `<div class="form-hint">${rows.length} member${rows.length===1?'':'s'} joined via invite code.</div>`;
-    })
-    .catch(()=>{ document.getElementById('membersList').innerHTML = `<div class="state-msg">Couldn't load members.</div>`; });
+  const alertEl = ()=> document.getElementById('manageAlert');
+  app.querySelectorAll('[data-new-commish]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      btn.disabled = true;
+      try{
+        await rpc('create_division_commish_invite', { p_division_id: btn.dataset.newCommish });
+        render();
+      }catch(e){
+        alertEl().innerHTML = `<div class="alert error">${escapeHtml(e.message)}</div>`;
+        btn.disabled = false;
+      }
+    });
+  });
+  app.querySelectorAll('[data-remove-commish]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Remove this division commissioner? You can invite someone else afterwards.')) return;
+      btn.disabled = true;
+      try{
+        await rpc('remove_division_commissioner', { p_division_id: btn.dataset.removeCommish });
+        render();
+      }catch(e){
+        alertEl().innerHTML = `<div class="alert error">${escapeHtml(e.message)}</div>`;
+        btn.disabled = false;
+      }
+    });
+  });
 
   document.getElementById('saveSettingsBtn').addEventListener('click', async ()=>{
-    const alertEl = document.getElementById('manageAlert');
     try{
-      await sbFetch(`/rest/v1/leagues?id=eq.${league.id}`, { method:'PATCH', headers:{Authorization:'Bearer '+session.access_token, Prefer:'return=minimal'}, body: JSON.stringify({
-        playoff_length_weeks: parseInt(document.getElementById('m_playoffweeks').value),
-        playoff_advance_count: parseInt(document.getElementById('m_advance').value),
-        is_public: document.getElementById('m_public').checked
-      })});
-      alertEl.innerHTML = `<div class="alert success">Settings saved.</div>`;
-    }catch(e){ alertEl.innerHTML = `<div class="alert error">${escapeHtml(e.message)}</div>`; }
+      await rpc('update_league_settings', {
+        p_league_id: league.id,
+        p_playoff_length_weeks: parseInt(document.getElementById('m_playoffweeks').value, 10),
+        p_playoff_advance_count: parseInt(document.getElementById('m_advance').value, 10),
+        p_is_public: document.getElementById('m_public').checked
+      });
+      alertEl().innerHTML = `<div class="alert success">Settings saved.</div>`;
+    }catch(e){
+      alertEl().innerHTML = `<div class="alert error">${escapeHtml(e.message)}</div>`;
+    }
   });
   document.getElementById('finalizeBtn').addEventListener('click', async ()=>{
+    if(!confirm('Mark this league as finalized?')) return;
     try{
-      await sbFetch(`/rest/v1/leagues?id=eq.${league.id}`, { method:'PATCH', headers:{Authorization:'Bearer '+session.access_token, Prefer:'return=minimal'}, body: JSON.stringify({finalized:true}) });
-      location.reload();
-    }catch(e){ document.getElementById('manageAlert').innerHTML = `<div class="alert error">${escapeHtml(e.message)}</div>`; }
+      await rpc('set_league_finalized', { p_league_id: league.id });
+      render();
+    }catch(e){
+      alertEl().innerHTML = `<div class="alert error">${escapeHtml(e.message)}</div>`;
+    }
   });
 }
 
-/* Patch router to handle /superbracket sub-route */
-const _origRenderLeagueRoute = renderLeagueRoute;
-renderLeagueRoute = async function(app, r){
-  if(r.sub==='superbracket'){
-    app.innerHTML = topbarHtml('#/') + `<div class="state-msg">Loading…</div>`;
-    const league = await getLeagueBySlug(r.slug);
-    if(!league){ app.innerHTML = topbarHtml('#/') + `<div class="state-msg error">League not found.</div>`; return; }
-    const divisions = await getDivisions(league.id);
-    return renderSuperBracketPage(app, league, divisions);
+/* ============================ DIVISION COMMISSIONER INVITE ============================ */
+async function renderCommishInvite(app, code){
+  if(!code){
+    app.innerHTML = topbarHtml('#/') + `<div class="alert error">This invite link is missing its code. Ask your league commissioner to send it again.</div>`;
+    return;
   }
-  return _origRenderLeagueRoute(app, r);
-};
+  if(!session){
+    app.innerHTML = topbarHtml('#/') + `
+      <div class="hero" style="margin:20px 0 20px;">
+        <h1 style="font-size:28px;">You're Invited to Run a Division</h1>
+        <p>Log in or create an account first, then we'll bring you right back to accept.</p>
+      </div>
+      <a class="primary-btn" href="${loginHref()}">Log In or Sign Up</a>`;
+    return;
+  }
+  app.innerHTML = topbarHtml('#/') + `
+    <div class="hero" style="margin:20px 0 20px;">
+      <h1 style="font-size:28px;">You're Invited to Run a Division</h1>
+      <p>As division commissioner you'll run the draft, manage teams and settle disputes for one division of this super league.</p>
+    </div>
+    <div id="inviteAlert"><div class="alert info">Accepting as <b>${escapeHtml(session.email)}</b>.</div></div>
+    <button class="primary-btn" id="acceptCommishBtn">Accept and Open Division</button>`;
+  document.getElementById('acceptCommishBtn').addEventListener('click', async (e)=>{
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = 'Accepting…';
+    try{
+      const res = await rpc('claim_division_commissioner', { p_code: code });
+      location.hash = `#/league/${res.slug}/division/${res.division_id}/settings`;
+    }catch(err){
+      document.getElementById('inviteAlert').innerHTML = `<div class="alert error">${escapeHtml(err.message)}</div>`;
+      btn.disabled = false;
+      btn.textContent = 'Accept and Open Division';
+    }
+  });
+}
+
 </script>
+<script src="hosted.js"></script>
 </body>
 </html>
