@@ -450,7 +450,10 @@ function friendlyAuthError(status, data, fallbackMsg){
     return "We couldn't email that address because this site's email service isn't fully set up yet. Ask your league commissioner for help.";
   if(status === 429 || /rate limit/i.test(code + ' ' + msg))
     return 'Too many requests right now. Wait a minute, then try again.';
-  return msg || fallbackMsg;
+  // Anything else: keep Supabase's own words and the status, so a failure can actually be diagnosed.
+  const detail = [status && `error ${status}`, code, msg].filter(Boolean).join(' · ');
+  if(status >= 500 || !msg) return `${fallbackMsg}${detail ? ` (${detail})` : ''}`;
+  return msg;
 }
 
 async function authRequest(path, body, fallbackMsg, opts={}){
@@ -462,9 +465,15 @@ async function authRequest(path, body, fallbackMsg, opts={}){
   }catch(e){
     throw new Error("Can't reach the login service right now. Check your connection and try again.");
   }
+  // Read as text first: gateway timeouts come back as HTML, not JSON.
+  const raw = await res.text().catch(()=> '');
   let data = {};
-  try{ data = await res.json(); }catch(e){}
-  if(!res.ok) throw new Error(friendlyAuthError(res.status, data, fallbackMsg));
+  try{ data = raw ? JSON.parse(raw) : {}; }catch(e){ data = {}; }
+  if(!res.ok){
+    console.warn('Supabase Auth error', res.status, path.split('?')[0], raw.slice(0, 500));
+    if(!data.msg && !data.message && !data.error_description && raw && !/^\s*</.test(raw)) data.msg = raw.slice(0, 200);
+    throw new Error(friendlyAuthError(res.status, data, fallbackMsg));
+  }
   return data;
 }
 function authSignUp(email, password){
@@ -477,7 +486,7 @@ function authSignIn(email, password){
 /* Password reset by emailed code: request → verify → set new password.
    The reset email must include {{ .Token }} (Supabase → Authentication → Email Templates → Reset Password). */
 function authSendRecoveryCode(email){
-  return authRequest('/auth/v1/recover', {email}, "Couldn't send a reset code. Try again in a minute.");
+  return authRequest('/auth/v1/recover', {email}, "Couldn't send a reset code.");
 }
 function authVerifyRecoveryCode(email, token){
   return authRequest('/auth/v1/verify', {type:'recovery', email, token}, 'That code is incorrect or has expired.');
