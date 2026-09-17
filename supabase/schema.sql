@@ -253,6 +253,52 @@ create index if not exists hosted_trades_div_idx     on public.hosted_trades(div
 create index if not exists hosted_tx_div_idx         on public.hosted_transactions(division_id, created_at desc);
 
 -- -----------------------------------------------------------------------------
+-- Clear out earlier versions
+--
+-- Earlier versions of this site defined some of these functions with different
+-- parameter names or return types, which CREATE OR REPLACE cannot change
+-- (e.g. join_league_by_code once took p_password). Existing policies on these
+-- tables are dropped first because they may depend on those functions; the
+-- policies this file wants are recreated at the end.
+-- -----------------------------------------------------------------------------
+
+do $$
+declare pol record; fn record;
+begin
+  for pol in
+    select policyname, tablename from pg_policies
+    where schemaname = 'public'
+      and tablename in ('leagues','divisions','espn_credentials','league_members','profiles',
+                        'hosted_settings','hosted_teams','hosted_rosters','hosted_lineups','hosted_drafts',
+                        'hosted_draft_picks','hosted_waiver_locks','hosted_waiver_claims','hosted_trades',
+                        'hosted_transactions')
+  loop
+    execute format('drop policy %I on public.%I', pol.policyname, pol.tablename);
+  end loop;
+
+  for fn in
+    select p.oid::regprocedure::text as sig
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public' and p.prokind = 'f'
+      and p.proname in (
+        '_require_uid','_slugify','_random_code','_random_digits6','_add_member','_ctx','_is_commish',
+        '_lock_division','_assert_commish','_assert_team_control','_max_roster','_starting_slots',
+        '_assert_draft_complete','_valid_player_id','_valid_position','_slot_eligible','_remove_from_lineup',
+        '_lock_waiver','_log','_draft_team_for_pick','_autofill_lineups','_process_waivers',
+        'is_league_member','can_view_league','set_display_name','get_my_profile','create_league',
+        'join_league_by_code','get_league_admin','update_league_settings','set_league_finalized',
+        'create_division_commish_invite','remove_division_commissioner','claim_division_commissioner',
+        'hosted_division_state','hosted_lineup_history','hosted_transactions_list','claim_hosted_team',
+        'rename_hosted_team','release_hosted_team','set_hosted_lineup','hosted_add_player','hosted_drop_player',
+        'hosted_submit_claim','hosted_cancel_claim','hosted_propose_trade','hosted_respond_trade',
+        'hosted_cancel_trade','hosted_draft_set_order','hosted_draft_randomize','hosted_draft_start',
+        'hosted_draft_pick','hosted_draft_undo','hosted_update_settings')
+  loop
+    execute 'drop function ' || fn.sig;
+  end loop;
+end $$;
+
+-- -----------------------------------------------------------------------------
 -- Helpers (names starting with "_" are internal and not callable by browsers)
 -- -----------------------------------------------------------------------------
 
@@ -1469,23 +1515,8 @@ begin
 end $$;
 
 -- -----------------------------------------------------------------------------
--- Row Level Security and privileges
+-- Row Level Security and privileges (old policies were cleared near the top)
 -- -----------------------------------------------------------------------------
-
-do $$
-declare pol record;
-begin
-  for pol in
-    select policyname, tablename from pg_policies
-    where schemaname = 'public'
-      and tablename in ('leagues','divisions','espn_credentials','league_members','profiles',
-                        'hosted_settings','hosted_teams','hosted_rosters','hosted_lineups','hosted_drafts',
-                        'hosted_draft_picks','hosted_waiver_locks','hosted_waiver_claims','hosted_trades',
-                        'hosted_transactions')
-  loop
-    execute format('drop policy %I on public.%I', pol.policyname, pol.tablename);
-  end loop;
-end $$;
 
 alter table public.leagues              enable row level security;
 alter table public.divisions            enable row level security;
