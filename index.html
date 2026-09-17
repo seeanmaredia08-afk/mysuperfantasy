@@ -438,16 +438,33 @@ function rpc(name, args){
   return sbFetch('/rest/v1/rpc/' + name, { method:'POST', body: JSON.stringify(args || {}) });
 }
 
-async function authRequest(path, body, fallbackMsg){
+/* Supabase Auth reports errors as { error_code, msg }. */
+function friendlyAuthError(status, data, fallbackMsg){
+  const code = data.error_code || '';
+  const msg = data.msg || data.error_description || data.message || '';
+  if(code === 'invalid_credentials') return 'Incorrect email or password.';
+  if(code === 'otp_expired') return 'That code is incorrect or has expired. Check the email, or send yourself a new code.';
+  if(code === 'same_password') return 'Your new password has to be different from your old one.';
+  if(code === 'weak_password') return msg || 'Choose a stronger password.';
+  if(code === 'email_address_not_authorized' || /not authorized/i.test(msg))
+    return "We couldn't email that address because this site's email service isn't fully set up yet. Ask your league commissioner for help.";
+  if(status === 429 || /rate limit/i.test(code + ' ' + msg))
+    return 'Too many requests right now. Wait a minute, then try again.';
+  return msg || fallbackMsg;
+}
+
+async function authRequest(path, body, fallbackMsg, opts={}){
+  const headers = { 'apikey':SB_ANON, 'Content-Type':'application/json' };
+  if(opts.token) headers.Authorization = 'Bearer ' + opts.token;
   let res;
   try{
-    res = await fetch(SB_URL + path, { method:'POST', headers:{'apikey':SB_ANON,'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    res = await fetch(SB_URL + path, { method: opts.method || 'POST', headers, body: JSON.stringify(body) });
   }catch(e){
     throw new Error("Can't reach the login service right now. Check your connection and try again.");
   }
   let data = {};
   try{ data = await res.json(); }catch(e){}
-  if(!res.ok) throw new Error(data.msg || data.error_description || data.message || fallbackMsg);
+  if(!res.ok) throw new Error(friendlyAuthError(res.status, data, fallbackMsg));
   return data;
 }
 function authSignUp(email, password){
@@ -455,6 +472,18 @@ function authSignUp(email, password){
 }
 function authSignIn(email, password){
   return authRequest('/auth/v1/token?grant_type=password', {email, password}, 'Incorrect email or password.');
+}
+
+/* Password reset by emailed code: request → verify → set new password.
+   The reset email must include {{ .Token }} (Supabase → Authentication → Email Templates → Reset Password). */
+function authSendRecoveryCode(email){
+  return authRequest('/auth/v1/recover', {email}, "Couldn't send a reset code. Try again in a minute.");
+}
+function authVerifyRecoveryCode(email, token){
+  return authRequest('/auth/v1/verify', {type:'recovery', email, token}, 'That code is incorrect or has expired.');
+}
+function authSetPassword(accessToken, password){
+  return authRequest('/auth/v1/user', {password}, "Couldn't update your password.", { method:'PUT', token: accessToken });
 }
 
 /* Signs up, or logs in if the email already has an account. Returns the session. */
@@ -891,6 +920,7 @@ function route(){
   if(parts[0]==='account' || parts[0]==='commissioner') return {view:'account', returnCode: query.code||'', returnName: query.name||'', next: query.next||''};
   if(parts[0]==='join') return {view:'join', code: query.code||'', name: query.name||''};
   if(parts[0]==='commish-invite') return {view:'commishInvite', code: query.code||''};
+  if(parts[0]==='forgot-password') return {view:'forgotPassword', next: query.next||''};
   if(parts[0]==='league' && parts[1]) return {view:'league', slug:parts[1], sub:parts[2], arg:parts[3], tab:parts[4]};
   return {view:'landing'};
 }
@@ -905,6 +935,7 @@ async function render(){
     else if(r.view==='account') await renderAccount(app, r.returnCode, r.returnName, r.next);
     else if(r.view==='join') await renderJoin(app, r.code, r.name);
     else if(r.view==='commishInvite') await renderCommishInvite(app, r.code);
+    else if(r.view==='forgotPassword') await renderForgotPassword(app, r.next);
     else if(r.view==='league') await renderLeagueRoute(app, r);
     focusActiveNav();
   }catch(err){
@@ -1069,6 +1100,7 @@ async function renderAccount(app, returnCode, returnName, next){
       <div class="form-group"><label class="form-label">Email</label><input class="form-input" type="email" id="l_email" autocomplete="email" required></div>
       <div class="form-group"><label class="form-label">Password</label><input class="form-input" type="password" id="l_password" autocomplete="current-password" required></div>
       <button type="submit" class="primary-btn" id="loginBtn">Log In</button>
+      <button type="button" class="linklike forgot-link" id="forgotLink">Forgot password?</button>
     </form>
 
     <form id="signupForm" style="max-width:420px;display:none;">
@@ -1098,6 +1130,12 @@ async function renderAccount(app, returnCode, returnName, next){
     if(destination){ location.hash = destination; return; }
     await renderMyLeagues(app, session.user_id);
   }
+
+  document.getElementById('forgotLink').addEventListener('click', ()=>{
+    // Carry the typed email over in memory rather than putting it in the URL.
+    forgotPasswordPrefill = document.getElementById('l_email').value.trim();
+    location.hash = `#/forgot-password${destination ? '?next=' + encodeURIComponent(destination) : ''}`;
+  });
 
   loginForm.addEventListener('submit', async (e)=>{
     e.preventDefault();
@@ -1135,6 +1173,194 @@ async function renderAccount(app, returnCode, returnName, next){
       btn.disabled = false; btn.textContent = 'Create Account';
     }
   });
+}
+
+/* ============================ FORGOT PASSWORD ============================
+   Three steps: email → verification code → new password. The code is checked
+   before the password form appears, and the session it grants is held only in
+   memory until the new password is saved, so abandoning the flow halfway
+   doesn't leave anyone logged in. Step 1 never reveals whether an account
+   exists for the address.                                                  */
+let forgotPasswordPrefill = '';
+const RECOVERY_RESEND_MS = 60000;   // Supabase allows one code request per email per minute
+
+async function renderForgotPassword(app, next){
+  const destination = next && next.startsWith('#/') && !/^#\/(account|forgot-password)/.test(next) ? next : '';
+  const st = { step:'email', email: forgotPasswordPrefill, verified: null, resendAt: 0 };
+  forgotPasswordPrefill = '';
+  let ticker = null;
+
+  const stepsHtml = active => {
+    const labels = ['Email', 'Code', 'New password'];
+    const idx = { email:0, code:1, password:2, done:3 }[active];
+    return `<div class="wizard-steps">${labels.map((l,i)=>`<span class="${i===idx?'on':i<idx?'done':''}">${i+1}. ${l}</span>`).join('')}</div>`;
+  };
+  const alertHtml = (kind, text) => `<div class="alert ${kind}">${escapeHtml(text)}</div>`;
+  const backToLogin = `<a href="#/account${destination ? '?next=' + encodeURIComponent(destination) : ''}">Back to log in</a>`;
+
+  function stopTicker(){ if(ticker){ clearInterval(ticker); ticker = null; } }
+
+  function paint(){
+    stopTicker();
+    if(st.step === 'email'){
+      app.innerHTML = topbarHtml('#/account') + `
+        <div class="hero auth-hero">${stepsHtml('email')}
+          <h1 style="font-size:28px;">Reset Your Password</h1>
+          <p>Enter the email address on your account and we'll send you a verification code.</p>
+        </div>
+        <div id="fpAlert"></div>
+        <form id="fpEmailForm" class="auth-card" novalidate>
+          <div class="form-group"><label class="form-label" for="fpEmail">Email</label>
+            <input class="form-input" type="email" id="fpEmail" autocomplete="email" value="${escapeHtml(st.email)}" required></div>
+          <button type="submit" class="primary-btn" id="fpSendBtn">Send Code</button>
+          <div class="auth-actions">${backToLogin}</div>
+        </form>`;
+      const input = document.getElementById('fpEmail');
+      if(!st.email) input.focus();
+      document.getElementById('fpEmailForm').addEventListener('submit', async (e)=>{
+        e.preventDefault();
+        const email = input.value.trim();
+        const alertEl = document.getElementById('fpAlert');
+        if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)){ alertEl.innerHTML = alertHtml('error', 'Enter a valid email address.'); return; }
+        const btn = document.getElementById('fpSendBtn');
+        btn.disabled = true; btn.textContent = 'Sending…';
+        try{
+          await authSendRecoveryCode(email);
+          st.email = email; st.step = 'code'; st.resendAt = Date.now() + RECOVERY_RESEND_MS;
+          paint();
+        }catch(err){
+          alertEl.innerHTML = alertHtml('error', err.message);
+          btn.disabled = false; btn.textContent = 'Send Code';
+        }
+      });
+      return;
+    }
+
+    if(st.step === 'code'){
+      app.innerHTML = topbarHtml('#/account') + `
+        <div class="hero auth-hero">${stepsHtml('code')}
+          <h1 style="font-size:28px;">Enter Your Code</h1>
+          <p>If there's an account for <b>${escapeHtml(st.email)}</b>, we've emailed it a verification code. The code expires in 1 hour — check your spam folder if it doesn't arrive.</p>
+        </div>
+        <div id="fpAlert"></div>
+        <form id="fpCodeForm" class="auth-card" novalidate>
+          <div class="form-group"><label class="form-label" for="fpCode">Verification Code</label>
+            <input class="form-input otp-input" id="fpCode" inputmode="numeric" autocomplete="one-time-code" maxlength="10" placeholder="••••••" required></div>
+          <button type="submit" class="primary-btn" id="fpVerifyBtn">Verify Code</button>
+          <div class="auth-actions">
+            <button type="button" class="linklike" id="fpResend"></button>
+            <button type="button" class="linklike" id="fpChangeEmail">Use a different email</button>
+          </div>
+        </form>`;
+      const codeInput = document.getElementById('fpCode');
+      codeInput.focus();
+      // Codes are digits; people often paste them with spaces.
+      codeInput.addEventListener('input', ()=>{ codeInput.value = codeInput.value.replace(/\D/g, '').slice(0, 10); });
+
+      const resendBtn = document.getElementById('fpResend');
+      const paintResend = ()=>{
+        const wait = Math.ceil((st.resendAt - Date.now()) / 1000);
+        resendBtn.disabled = wait > 0;
+        resendBtn.textContent = wait > 0 ? `Send a new code in ${wait}s` : 'Send a new code';
+        if(wait <= 0) stopTicker();
+      };
+      paintResend();
+      ticker = setInterval(()=>{ if(!document.body.contains(resendBtn)) stopTicker(); else paintResend(); }, 1000);
+
+      resendBtn.addEventListener('click', async ()=>{
+        const alertEl = document.getElementById('fpAlert');
+        resendBtn.disabled = true;
+        try{
+          await authSendRecoveryCode(st.email);
+          st.resendAt = Date.now() + RECOVERY_RESEND_MS;
+          alertEl.innerHTML = alertHtml('success', 'A new code is on its way. Use the newest one — earlier codes stop working.');
+          stopTicker(); paintResend();
+          ticker = setInterval(()=>{ if(!document.body.contains(resendBtn)) stopTicker(); else paintResend(); }, 1000);
+        }catch(err){
+          alertEl.innerHTML = alertHtml('error', err.message);
+          paintResend();
+        }
+      });
+      document.getElementById('fpChangeEmail').addEventListener('click', ()=>{ st.step = 'email'; paint(); });
+
+      document.getElementById('fpCodeForm').addEventListener('submit', async (e)=>{
+        e.preventDefault();
+        const code = codeInput.value.trim();
+        const alertEl = document.getElementById('fpAlert');
+        if(!/^\d{6,10}$/.test(code)){ alertEl.innerHTML = alertHtml('error', 'Enter the code from the email — it\'s at least 6 digits.'); return; }
+        const btn = document.getElementById('fpVerifyBtn');
+        btn.disabled = true; btn.textContent = 'Checking…';
+        try{
+          st.verified = await authVerifyRecoveryCode(st.email, code);
+          if(!st.verified || !st.verified.access_token) throw new Error('That code is incorrect or has expired.');
+          st.step = 'password';
+          paint();
+        }catch(err){
+          alertEl.innerHTML = alertHtml('error', err.message);
+          btn.disabled = false; btn.textContent = 'Verify Code';
+          codeInput.select();
+        }
+      });
+      return;
+    }
+
+    if(st.step === 'password'){
+      app.innerHTML = topbarHtml('#/account') + `
+        <div class="hero auth-hero">${stepsHtml('password')}
+          <h1 style="font-size:28px;">Choose a New Password</h1>
+          <p>Code verified for <b>${escapeHtml(st.email)}</b>. Pick a new password to finish.</p>
+        </div>
+        <div id="fpAlert"></div>
+        <form id="fpPasswordForm" class="auth-card" novalidate>
+          <input type="email" value="${escapeHtml(st.email)}" autocomplete="username" hidden>
+          <div class="form-group"><label class="form-label" for="fpNew">New Password</label>
+            <input class="form-input" type="password" id="fpNew" autocomplete="new-password" placeholder="At least 6 characters" required></div>
+          <div class="form-group"><label class="form-label" for="fpConfirm">Confirm New Password</label>
+            <input class="form-input" type="password" id="fpConfirm" autocomplete="new-password" required></div>
+          <button type="submit" class="primary-btn" id="fpSaveBtn">Save New Password</button>
+        </form>`;
+      document.getElementById('fpNew').focus();
+      document.getElementById('fpPasswordForm').addEventListener('submit', async (e)=>{
+        e.preventDefault();
+        const pw = document.getElementById('fpNew').value;
+        const confirmPw = document.getElementById('fpConfirm').value;
+        const alertEl = document.getElementById('fpAlert');
+        if(pw.length < 6){ alertEl.innerHTML = alertHtml('error', 'Your password needs at least 6 characters.'); return; }
+        if(pw !== confirmPw){ alertEl.innerHTML = alertHtml('error', "Those passwords don't match."); return; }
+        const btn = document.getElementById('fpSaveBtn');
+        btn.disabled = true; btn.textContent = 'Saving…';
+        try{
+          await authSetPassword(st.verified.access_token, pw);
+          saveSession(sessionFromAuth(st.verified, st.email));
+          st.verified = null;
+          st.step = 'done';
+          paint();
+        }catch(err){
+          alertEl.innerHTML = alertHtml('error', err.message);
+          btn.disabled = false; btn.textContent = 'Save New Password';
+        }
+      });
+      return;
+    }
+
+    // done
+    app.innerHTML = topbarHtml() + `
+      <div class="hero auth-hero">${stepsHtml('done')}
+        <h1 style="font-size:28px;">Password Updated</h1>
+        <p>You're logged in as <b>${escapeHtml(st.email)}</b>. Use your new password next time.</p>
+      </div>
+      <a class="primary-btn" href="${destination || '#/account'}">${destination ? 'Continue' : 'Go to My Leagues'}</a>`;
+  }
+
+  if(session){
+    app.innerHTML = topbarHtml('#/') + `
+      <div class="hero auth-hero"><h1 style="font-size:28px;">Reset Your Password</h1>
+        <p>You're currently logged in as <b>${escapeHtml(session.email)}</b>. Log out first to reset the password for an account.</p></div>
+      <button type="button" class="primary-btn" id="fpLogout">Log Out and Continue</button>`;
+    document.getElementById('fpLogout').addEventListener('click', ()=>{ saveSession(null); paint(); });
+    return;
+  }
+  paint();
 }
 
 async function renderMyLeagues(app, uid){
